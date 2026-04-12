@@ -1,23 +1,76 @@
 # Geyser Education Extension
 
-**Completely optional** [Geyser](https://geysermc.org/) extension that broadcasts your server to Minecraft Education Edition's built-in server list. When installed, students in your tenant see the server appear automatically in their server browser - no IP address, no resource pack, no link needed. They just open Education Edition and click Play.
+Optional [Geyser](https://geysermc.org/) extension that adds two ways for Minecraft Education Edition students to discover and join your server:
 
-**This extension is not required for education clients to connect.** Education support in [EduGeyser](https://github.com/SendableMetatype/EduGeyser) works out of the box with zero configuration. Students can always connect via direct IP or a connection link. This extension only adds the convenience of automatic server list broadcasting.
+1. **Server List** - Broadcasts your server to Education Edition's built-in server browser. Students see the server automatically and click Play.
+2. **Join Codes** - Creates join codes that students can enter in the Education Edition "Join Code" screen, or click a share link.
 
-**Requires Global Admin access to an M365 Education tenant.** Only a tenant administrator can register servers in the Education Edition server list. If you are a teacher, student, or do not have Global Admin access, you do not need this extension - students can connect via direct IP instead.
+**This extension is not required for education clients to connect.** Education support in [EduGeyser](https://github.com/SendableMetatype/GeyserFork) works out of the box. Students can always connect via direct IP. This extension only adds server list broadcasting and join codes.
 
 ## Requirements
 
-- Geyser with education support (EduGeyser)
-- Global Admin access to each M365 Education tenant you want to broadcast to
+- [EduGeyser](https://github.com/SendableMetatype/GeyserFork) (Geyser fork with education support)
 - Java 17+
+- For server list: Global Admin access to an M365 Education tenant
+- For join codes: Any M365 Education account
 
 ## Setup
 
-1. Download the latest release JAR
+1. Download the latest release JAR from [Releases](https://github.com/SendableMetatype/Geyser-Education-Extension/releases)
 2. Place it in Geyser's `extensions/` folder
-3. Start the server once to generate the config file
-4. Edit `plugins/Geyser-*/extensions/edu/serverlist_config.yml`:
+3. Start the server once to generate config files
+4. Configure as needed (see below)
+5. Restart the server
+
+## Join Codes
+
+Join codes let students connect by entering symbols in Education Edition's join screen, or by clicking a share link. Join codes are tenant-scoped: each code only works for students in the same tenant as the account that created it.
+
+### Quick Start
+
+1. Run `/edu joincode add` from the console
+2. Sign in with any M365 Education account when prompted
+3. The join code and share link are printed to the console
+4. Share the link with students: `https://education.minecraft.net/joinworld/...`
+
+Active join codes are printed to the console every 3 minutes as a reminder.
+
+### Multiple Tenants
+
+Run `/edu joincode add` once per tenant. Each requires a separate education account sign-in.
+
+### Configuration
+
+Edit `plugins/Geyser-*/extensions/edu/joincode_config.yml`:
+
+```yaml
+world-name: "My School Server"
+host-name: "EduGeyser"
+server-ip: ""       # Leave empty to auto-detect, or set to "play.example.com:19132"
+max-players: 40
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/edu joincode` | Show active join codes with share links |
+| `/edu joincode add` | Create a join code for a new tenant |
+| `/edu joincode remove <number>` | Remove a join code by its index |
+
+### Notes
+
+- Join codes change on server restart (new Nethernet ID each time)
+- Codes stay alive via heartbeat as long as the server is running
+- No Global Admin access required, any education account works
+
+## Server List
+
+Broadcasts your server to Education Edition's built-in server browser. Requires Global Admin access to each M365 Education tenant.
+
+### Quick Start
+
+1. Edit `plugins/Geyser-*/extensions/edu/serverlist_config.yml`:
 
 ```yaml
 server-name: "My School Server"
@@ -25,16 +78,16 @@ server-ip: "play.example.com:19132"
 max-players: 40
 ```
 
-5. Restart the server
-6. Run `/edu serverlist add` from the console
-7. Two device code prompts will appear - sign in with a Global Admin M365 Education account
-8. The server now appears in Education Edition's server list for all students in that tenant
+2. Restart the server
+3. Run `/edu serverlist add` from the console
+4. Two device code prompts appear - sign in with a Global Admin M365 Education account
+5. The server now appears in Education Edition's server list for that tenant
 
-## Broadcasting to Multiple Tenants
+### Multiple Tenants
 
-Run `/edu serverlist add` once for each tenant. Each tenant requires its own Global Admin account. All accounts share the same server name, IP, and max player count from the config.
+Run `/edu serverlist add` once per tenant. Each requires its own Global Admin account.
 
-## Commands
+### Commands
 
 | Command | Description |
 |---------|-------------|
@@ -46,14 +99,10 @@ Run `/edu serverlist add` once for each tenant. Each tenant requires its own Glo
 
 | File | Purpose |
 |------|---------|
-| `serverlist_config.yml` | Server name, IP, and max players (edit this) |
-| `sessions_serverlist.yml` | OAuth tokens and session data (managed automatically, do not edit) |
-
-## How It Works
-
-The extension authenticates with Microsoft's Education Server Services (MESS) using OAuth device code flows and registers the server via the MESS dedicated server API. Once registered, all Education Edition clients in the tenant see the server in their built-in server list automatically. The extension sends periodic heartbeats to keep the server listed as online and refreshes tokens automatically.
-
-Each account requires two sign-ins: one for server management (tooling API) and one for server registration (education client API). Both use the same Global Admin account.
+| `joincode_config.yml` | Join code world name, host name, server IP, max players |
+| `sessions_joincode.yml` | Join code OAuth tokens (managed automatically) |
+| `serverlist_config.yml` | Server list name, IP, max players |
+| `sessions_serverlist.yml` | Server list OAuth tokens (managed automatically) |
 
 ## Building
 
@@ -61,4 +110,4 @@ Each account requires two sign-ins: one for server management (tooling API) and 
 ./gradlew build
 ```
 
-The JAR is output to `build/libs/`.
+The JAR is output to `build/libs/`. Includes native WebRTC libraries for all platforms (Windows/Linux/macOS, x86_64/aarch64).
