@@ -1,13 +1,15 @@
 # Geyser Education Extension
 
-Optional [Geyser](https://geysermc.org/) extension that registers your server in Minecraft Education Edition's built-in server list. Students can find and connect to the server directly from the in-game server browser without entering an IP address.
+**Completely optional** [Geyser](https://geysermc.org/) extension that broadcasts your server to Minecraft Education Edition's built-in server list. When installed, students in your tenant see the server appear automatically in their server browser - no IP address, no resource pack, no link needed. They just open Education Edition and click Play.
 
-This extension is for servers already running [EduGeyser](https://github.com/SendableMetatype/EduGeyser) (or Geyser with education support). Education clients can connect without this extension - it only adds server list visibility.
+**This extension is not required for education clients to connect.** Education support in [EduGeyser](https://github.com/SendableMetatype/EduGeyser) works out of the box with zero configuration. Students can always connect via direct IP or a connection link. This extension only adds the convenience of automatic server list broadcasting.
+
+**Requires Global Admin access to an M365 Education tenant.** Only a tenant administrator can register servers in the Education Edition server list. If you are a teacher, student, or do not have Global Admin access, you do not need this extension - students can connect via direct IP instead.
 
 ## Requirements
 
 - Geyser with education support (EduGeyser)
-- A Global Admin account for each M365 Education tenant you want the server listed on
+- Global Admin access to each M365 Education tenant you want to broadcast to
 - Java 17+
 
 ## Setup
@@ -25,12 +27,12 @@ max-players: 40
 
 5. Restart the server
 6. Run `/edu serverlist add` from the console
-7. Two device code prompts will appear - sign in with a Global Admin M365 Education account for each
-8. The server is now visible in Education Edition's server list for that tenant
+7. Two device code prompts will appear - sign in with a Global Admin M365 Education account
+8. The server now appears in Education Edition's server list for all students in that tenant
 
-## Adding Multiple Tenants
+## Broadcasting to Multiple Tenants
 
-Run `/edu serverlist add` again for each additional school. Each tenant needs its own Global Admin account. All accounts share the same server name, IP, and max player count from the config.
+Run `/edu serverlist add` once for each tenant. Each tenant requires its own Global Admin account. All accounts share the same server name, IP, and max player count from the config.
 
 ## Commands
 
@@ -49,7 +51,7 @@ Run `/edu serverlist add` again for each additional school. Each tenant needs it
 
 ## How It Works
 
-The extension authenticates with Microsoft's Education Server Services (MESS) using OAuth device code flows. It registers the server via the MESS dedicated server API, configures tenant settings, and sends periodic heartbeats to keep the server listed as online. Token refresh happens automatically every 30 minutes.
+The extension authenticates with Microsoft's Education Server Services (MESS) using OAuth device code flows and registers the server via the MESS dedicated server API. Once registered, all Education Edition clients in the tenant see the server in their built-in server list automatically. The extension sends periodic heartbeats to keep the server listed as online and refreshes tokens automatically.
 
 Each account requires two sign-ins: one for server management (tooling API) and one for server registration (education client API). Both use the same Global Admin account.
 
