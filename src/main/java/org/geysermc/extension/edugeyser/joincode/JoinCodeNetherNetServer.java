@@ -64,7 +64,7 @@ public class JoinCodeNetherNetServer {
         this.signaling = new NetherNetXboxSignaling(netherNetId, mcTokenHeader);
 
         this.bossGroup = new NioEventLoopGroup(1);
-        this.workerGroup = new NioEventLoopGroup();
+        this.workerGroup = new NioEventLoopGroup(2);
 
         try {
             ServerBootstrap bootstrap = new ServerBootstrap();
@@ -74,7 +74,7 @@ public class JoinCodeNetherNetServer {
 
             this.netherNetChannel = bootstrap.bind(new InetSocketAddress(0)).sync().channel();
 
-            logger.info("[JoinCode] Nethernet server started on ID: " + netherNetId);
+            logger.debug("[JoinCode] Nethernet server started on ID: " + netherNetId);
             return netherNetId;
         } catch (Exception e) {
             logger.error("[JoinCode] Failed to start Nethernet server: " + e.getMessage());

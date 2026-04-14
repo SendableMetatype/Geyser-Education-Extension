@@ -100,7 +100,7 @@ public class JoinCodeManager {
                     account.discoveryClient.dehost();
                 } catch (Exception e) {
                     extension.logger().warning(LOG_PREFIX + "Dehost failed for tenant " +
-                            (account.tenantId != null ? account.tenantId : "unknown") + ": " + e.getMessage());
+                            account.displayLabel() + ": " + e.getMessage());
                 }
             }
             if (account.netherNetServer != null) {
@@ -135,10 +135,10 @@ public class JoinCodeManager {
         boolean hasRefresh = account.refreshToken != null && !account.refreshToken.isEmpty();
 
         if (hasRefresh && account.passcode != null) {
-            extension.logger().info(LOG_PREFIX + "Restoring account #" + (index + 1) +
-                    (account.tenantId != null ? " (tenant: " + account.tenantId + ")" : "") + "...");
             try {
                 refreshAccessToken(account);
+                extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) +
+                        " (" + account.displayLabel() + ")...");
                 completeAuthFlow(account, index);
                 logAccountActive(account, index);
                 return;
@@ -149,7 +149,7 @@ public class JoinCodeManager {
         }
 
         if (hasRefresh) {
-            extension.logger().info(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
+            extension.logger().debug(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
             clearAccountSession(account);
         }
 
@@ -207,7 +207,7 @@ public class JoinCodeManager {
     private void logAccountActive(JoinCodeAccount account, int index) {
         extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " active: " +
                 (account.humanReadableCode != null ? account.humanReadableCode : "unknown") +
-                (account.tenantId != null ? " (tenant: " + account.tenantId + ")" : "") +
+                (" (" + account.displayLabel() + ")") +
                 (account.passcode != null ? " | " + DiscoveryClient.createShareLink(account.passcode) : ""));
     }
 
@@ -226,7 +226,7 @@ public class JoinCodeManager {
                         completeAuthFlow(account, index);
                         source.sendMessage(LOG_PREFIX + "Join code #" + (index + 1) + " active: " +
                                 (account.humanReadableCode != null ? account.humanReadableCode : "unknown") +
-                                (account.tenantId != null ? " (tenant: " + account.tenantId + ")" : ""));
+                                (" (" + account.displayLabel() + ")"));
                         if (account.passcode != null) {
                             source.sendMessage(LOG_PREFIX + "Link: " + DiscoveryClient.createShareLink(account.passcode));
                         }
@@ -281,7 +281,7 @@ public class JoinCodeManager {
         saveAllAccounts();
         source.sendMessage(LOG_PREFIX + "Removed join code #" + number +
                 (oldCode != null ? " (" + oldCode + ")" : "") +
-                (account.tenantId != null ? " tenant: " + account.tenantId : ""));
+                (" " + account.displayLabel()));
     }
 
     // ---- Heartbeat (per account) ----
@@ -292,7 +292,7 @@ public class JoinCodeManager {
             if (account.discoveryClient != null) {
                 if (!account.discoveryClient.heartbeat()) {
                     extension.logger().warning(LOG_PREFIX + "Heartbeat failed for tenant " +
-                            (account.tenantId != null ? account.tenantId : "unknown"));
+                            account.displayLabel());
                 }
             }
         }, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
@@ -306,7 +306,7 @@ public class JoinCodeManager {
             for (JoinCodeAccount a : accounts) {
                 if (a.active && a.humanReadableCode != null && a.passcode != null) {
                     extension.logger().info(LOG_PREFIX + "Join code" +
-                            (a.tenantId != null ? " (" + a.tenantId + ")" : "") +
+                            " (" + a.displayLabel() + ")" +
                             ": " + a.humanReadableCode +
                             " | " + DiscoveryClient.createShareLink(a.passcode));
                 }
@@ -367,7 +367,8 @@ public class JoinCodeManager {
                     account.refreshToken = response.has("refresh_token")
                             ? response.get("refresh_token").getAsString() : null;
                     account.accessTokenExpires = parseTokenExpiry(response);
-                    extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " authenticated!");
+                    account.extractTokenClaims();
+                    extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " authenticated as " + account.displayLabel());
                     future.complete(null);
                     return;
                 }
@@ -413,6 +414,7 @@ public class JoinCodeManager {
         account.refreshToken = response.has("refresh_token")
                 ? response.get("refresh_token").getAsString() : account.refreshToken;
         account.accessTokenExpires = parseTokenExpiry(response);
+        account.extractTokenClaims();
         saveAllAccounts();
     }
 
@@ -448,7 +450,7 @@ public class JoinCodeManager {
         }
         for (int i = 0; i < accounts.size(); i++) {
             JoinCodeAccount a = accounts.get(i);
-            String tenant = a.tenantId != null ? a.tenantId : "unknown";
+            String tenant = a.displayLabel();
             String status = a.active ? "active" : "inactive";
             String code = a.humanReadableCode != null ? a.humanReadableCode : "none";
             source.sendMessage("  #" + (i + 1) + " | tenant: " + tenant + " | code: " + code + " | " + status);
@@ -470,7 +472,8 @@ public class JoinCodeManager {
                         "world-name: \"Education Server\"\n\n" +
                         "# Host name shown to joining clients.\n" +
                         "host-name: \"EduGeyser\"\n\n" +
-                        "# Public IP:port for the TransferPacket (e.g. \"mc.example.com:19132\").\n" +
+                        "# Public IP or hostname for the TransferPacket (e.g. \"mc.example.com\").\n" +
+                        "# Port is always read from Geyser automatically.\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
                         "# Maximum players shown.\n" +
@@ -500,7 +503,7 @@ public class JoinCodeManager {
         if (detectedIp != null) {
             int port = extension.geyserApi().bedrockListener().port();
             serverIp = detectedIp.contains(":") ? "[" + detectedIp + "]:" + port : detectedIp + ":" + port;
-            extension.logger().info(LOG_PREFIX + "Auto-detected server IP: " + serverIp);
+            extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + serverIp);
         } else {
             extension.logger().warning(LOG_PREFIX + "Could not detect public IP. Set server-ip in joincode_config.yml");
         }
@@ -544,6 +547,7 @@ public class JoinCodeManager {
                         a.passcode = node.node("passcode").getString();
                         a.serverToken = node.node("server-token").getString();
                         a.extractTenantId();
+                        a.extractTokenClaims();
                         if (a.passcode != null) {
                             a.humanReadableCode = DiscoveryClient.parseJoinCode(a.passcode);
                         }

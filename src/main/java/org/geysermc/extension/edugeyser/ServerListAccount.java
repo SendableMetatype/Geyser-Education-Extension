@@ -1,6 +1,11 @@
 package org.geysermc.extension.edugeyser;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.checkerframework.checker.nullness.qual.Nullable;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 
 /**
  * Holds the session state for a single MESS server list registration.
@@ -23,6 +28,7 @@ public class ServerListAccount {
 
     // Runtime
     volatile @Nullable String tenantId;
+    volatile @Nullable String upn;
     volatile boolean active = false;
 
     /**
@@ -32,5 +38,46 @@ public class ServerListAccount {
         if (serverToken != null && serverToken.contains("|")) {
             tenantId = serverToken.split("\\|")[0];
         }
+    }
+
+    /**
+     * Extract UPN and tenant ID from access token JWT payloads.
+     * Tries both tooling and edu tokens since either may contain the UPN.
+     */
+    void extractTokenClaims() {
+        extractClaimsFromToken(accessToken);
+        extractClaimsFromToken(eduAccessToken);
+    }
+
+    private void extractClaimsFromToken(@Nullable String token) {
+        if (token == null) return;
+        try {
+            String[] parts = token.split("\\.");
+            if (parts.length < 2) return;
+            String padded = parts[1];
+            while (padded.length() % 4 != 0) padded += "=";
+            String json = new String(Base64.getUrlDecoder().decode(padded), StandardCharsets.UTF_8);
+            JsonObject claims = JsonParser.parseString(json).getAsJsonObject();
+            if (upn == null) {
+                if (claims.has("upn")) {
+                    upn = claims.get("upn").getAsString();
+                } else if (claims.has("preferred_username")) {
+                    upn = claims.get("preferred_username").getAsString();
+                }
+            }
+            if (tenantId == null && claims.has("tid")) {
+                tenantId = claims.get("tid").getAsString();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Display label: UPN if available, otherwise tenant ID, otherwise "unknown".
+     */
+    String displayLabel() {
+        if (upn != null) return upn;
+        if (tenantId != null) return tenantId;
+        return "unknown";
     }
 }

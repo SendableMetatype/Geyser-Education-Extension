@@ -67,14 +67,18 @@ public class MessServerListManager {
     public void initialize() {
         loadAllAccounts();
 
-        // Resolve global IP if not set
+        // Resolve IP:port — always use Geyser's port, only IP from config or auto-detect
+        int port = extension.geyserApi().bedrockListener().port();
         if (globalServerIp == null || globalServerIp.isEmpty()) {
             String detectedIp = detectPublicIp();
             if (detectedIp != null) {
-                int port = extension.geyserApi().bedrockListener().port();
                 globalServerIp = formatIpPort(detectedIp, port);
-                extension.logger().info(LOG_PREFIX + "Auto-detected server IP: " + globalServerIp);
+                extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + globalServerIp);
             }
+        } else {
+            // Strip any port from config value, always use Geyser's port
+            String ip = globalServerIp.contains(":") ? globalServerIp.substring(0, globalServerIp.lastIndexOf(':')) : globalServerIp;
+            globalServerIp = formatIpPort(ip, port);
         }
 
         // Start auth flows for existing accounts
@@ -96,7 +100,7 @@ public class MessServerListManager {
                 try {
                     dehostServer(account);
                 } catch (Exception e) {
-                    extension.logger().error(LOG_PREFIX + "Failed to dehost account " + account.tenantId + ": " + e.getMessage());
+                    extension.logger().error(LOG_PREFIX + "Failed to dehost account " + account.displayLabel() + ": " + e.getMessage());
                 }
             }
         }
@@ -129,7 +133,7 @@ public class MessServerListManager {
                 fetchServerToken(account);
             } else {
                 registerNewServer(account);
-                extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
+                extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
             }
 
             tryEditTenantSettings(account);
@@ -140,7 +144,7 @@ public class MessServerListManager {
             saveAllAccounts();
 
             extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " hosted at " + globalServerIp +
-                    " (tenant: " + (account.tenantId != null ? account.tenantId : "unknown") + ")");
+                    " (" + account.displayLabel() + ")");
 
             if (shutdownRequested) return;
             scheduleServerUpdates(account);
@@ -155,10 +159,10 @@ public class MessServerListManager {
         boolean hasEdu = account.eduRefreshToken != null && !account.eduRefreshToken.isEmpty();
 
         if (hasTooling && hasEdu && account.serverId != null && !account.serverId.isEmpty()) {
-            extension.logger().info(LOG_PREFIX + "Restoring account #" + (index + 1) + " (serverId=" + account.serverId + ")");
             try {
                 ensureValidAccessToken(account);
                 ensureValidEduAccessToken(account);
+                extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) + " (" + account.displayLabel() + ")");
                 completeAuthFlow(account, index);
                 return;
             } catch (InterruptedException e) {
@@ -169,7 +173,7 @@ public class MessServerListManager {
         }
 
         if (hasTooling || hasEdu) {
-            extension.logger().info(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
+            extension.logger().debug(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
             clearAccountSession(account);
         }
 
@@ -191,7 +195,7 @@ public class MessServerListManager {
             doDeviceCodeFlows(account, index).thenRun(() -> {
                 completeAuthFlow(account, index);
                 source.sendMessage(LOG_PREFIX + "Account #" + (index + 1) + " registered successfully!" +
-                        " Tenant: " + (account.tenantId != null ? account.tenantId : "unknown"));
+                        " Tenant: " + account.displayLabel());
             }).exceptionally(ex -> {
                 extension.logger().error(LOG_PREFIX + "Failed to add account: " + ex.getMessage());
                 accounts.remove(account);
@@ -225,29 +229,29 @@ public class MessServerListManager {
         accounts.remove(account);
         saveAllAccounts();
         source.sendMessage(LOG_PREFIX + "Removed account #" + number +
-                (account.tenantId != null ? " (tenant: " + account.tenantId + ")" : ""));
+                (" (" + account.displayLabel() + ")"));
     }
 
     // ---- Device Code OAuth ----
 
     private CompletableFuture<Void> doDeviceCodeFlows(ServerListAccount account, int index) {
-        extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + ": Two sign-ins required.");
-
-        extension.logger().info(LOG_PREFIX + "Step 1/2: Sign in for server management (tooling)...");
+        extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + ": Two sign-ins required.");
         return doDeviceCodeFlow(TOOLING_CLIENT_ID, "tooling authentication").thenCompose(toolingTokens -> {
             account.accessToken = toolingTokens.get("access_token").getAsString();
             account.refreshToken = toolingTokens.has("refresh_token")
                     ? toolingTokens.get("refresh_token").getAsString() : null;
             account.accessTokenExpires = parseTokenExpiry(toolingTokens);
+            account.extractTokenClaims();
 
-            extension.logger().info(LOG_PREFIX + "Step 2/2: Sign in for server registration...");
+            extension.logger().debug(LOG_PREFIX + "Step 2/2: Sign in for server registration...");
             return doDeviceCodeFlow(EDU_CLIENT_ID, "server authentication");
         }).thenAccept(eduTokens -> {
             account.eduAccessToken = eduTokens.get("access_token").getAsString();
             account.eduRefreshToken = eduTokens.has("refresh_token")
                     ? eduTokens.get("refresh_token").getAsString() : null;
             account.eduAccessTokenExpires = parseTokenExpiry(eduTokens);
-            extension.logger().info(LOG_PREFIX + "Both authentications successful!");
+            account.extractTokenClaims();
+            extension.logger().debug(LOG_PREFIX + "Both authentications successful (" + account.displayLabel() + ")!");
         });
     }
 
@@ -274,7 +278,7 @@ public class MessServerListManager {
             extension.logger().info(LOG_PREFIX + "  Enter code: " + userCode);
             extension.logger().info(LOG_PREFIX + "  (" + label + ")");
             extension.logger().info(LOG_PREFIX + "============================================");
-            extension.logger().info(LOG_PREFIX + "Waiting for sign-in...");
+            extension.logger().debug(LOG_PREFIX + "Waiting for sign-in...");
 
             String pollBody = pollBodyBase + "&device_code=" + URLEncoder.encode(deviceCode, StandardCharsets.UTF_8);
             long deadline = System.currentTimeMillis() + (expiresIn * 1000L);
@@ -302,7 +306,7 @@ public class MessServerListManager {
             try {
                 JsonObject response = postForm(tokenUrl, pollBody);
                 if (response.has("access_token")) {
-                    extension.logger().info(LOG_PREFIX + "Authentication successful (" + label + ")!");
+                    extension.logger().debug(LOG_PREFIX + "Authentication successful (" + label + ")!");
                     future.complete(response);
                     return;
                 }
@@ -343,6 +347,7 @@ public class MessServerListManager {
                 account.refreshToken = response.has("refresh_token")
                         ? response.get("refresh_token").getAsString() : account.refreshToken;
                 account.accessTokenExpires = parseTokenExpiry(response);
+                account.extractTokenClaims();
                 saveAllAccounts();
                 return true;
             }
@@ -365,6 +370,7 @@ public class MessServerListManager {
                 account.eduRefreshToken = response.has("refresh_token")
                         ? response.get("refresh_token").getAsString() : account.eduRefreshToken;
                 account.eduAccessTokenExpires = parseTokenExpiry(response);
+                account.extractTokenClaims();
                 saveAllAccounts();
                 return true;
             }
@@ -444,7 +450,7 @@ public class MessServerListManager {
             body.addProperty("TeachersAllowed", true);
             body.addProperty("CrossTenantAllowed", true);
             postJsonWithAuth(MESS_BASE + "/tooling/edit_tenant_settings", account.accessToken, body.toString());
-            extension.logger().info(LOG_PREFIX + "Tenant settings configured: dedicated servers enabled, teacher access, cross-tenant.");
+            extension.logger().debug(LOG_PREFIX + "Tenant settings configured: dedicated servers enabled, teacher access, cross-tenant.");
         } catch (IOException e) {
             extension.logger().warning(LOG_PREFIX + "Could not update tenant settings (may require Global Admin): " + e.getMessage());
             extension.logger().warning(LOG_PREFIX + "  https://education.minecraft.net/teachertools/en_US/dedicatedservers/");
@@ -465,7 +471,7 @@ public class MessServerListManager {
             body.addProperty("CrossTenantAllowed", true);
             postJsonWithAuth(MESS_BASE + "/tooling/edit_server_info", account.accessToken, body.toString(),
                     Map.of("api-version", "2.0"));
-            extension.logger().info(LOG_PREFIX + "Server info configured for " + account.serverId);
+            extension.logger().debug(LOG_PREFIX + "Server info configured for " + account.serverId);
         } catch (IOException e) {
             extension.logger().warning(LOG_PREFIX + "Could not update server info: " + e.getMessage());
         }
@@ -528,7 +534,7 @@ public class MessServerListManager {
     }
 
     private void scheduleTokenRefresh(ServerListAccount account) {
-        String accountLabel = account.tenantId != null ? account.tenantId : account.serverId;
+        String accountLabel = account.displayLabel();
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
             try {
                 boolean accessValid = account.accessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS
@@ -581,7 +587,7 @@ public class MessServerListManager {
         }
         for (int i = 0; i < accounts.size(); i++) {
             ServerListAccount a = accounts.get(i);
-            String tenant = a.tenantId != null ? a.tenantId : "unknown";
+            String tenant = a.displayLabel();
             String status = a.active ? "active" : "inactive";
             String expiry = "";
             if (a.serverTokenExpires > 0) {
@@ -618,7 +624,8 @@ public class MessServerListManager {
                         "# EduGeyser Server List Configuration\n\n" +
                         "# Display name shown in the Education Edition server list.\n" +
                         "server-name: \"\"\n\n" +
-                        "# Public IP:port for MESS registration (e.g. \"mc.example.com:19132\").\n" +
+                        "# Public IP or hostname (e.g. \"mc.example.com\").\n" +
+                        "# Port is always read from Geyser automatically.\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
                         "# Maximum players shown in the server list.\n" +
@@ -673,6 +680,7 @@ public class MessServerListManager {
                         a.serverTokenJwt = node.node("server-token-jwt").getString();
                         a.serverTokenExpires = node.node("server-token-expires").getLong(0);
                         a.extractTenantId();
+                        a.extractTokenClaims();
                         accounts.add(a);
                     }
                 }
