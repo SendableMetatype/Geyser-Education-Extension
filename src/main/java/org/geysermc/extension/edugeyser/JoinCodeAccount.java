@@ -3,7 +3,6 @@ package org.geysermc.extension.edugeyser;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.checkerframework.checker.nullness.qual.Nullable;
-import org.geysermc.extension.edugeyser.joincode.JoinCodeNetherNetServer;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -11,8 +10,10 @@ import java.util.Base64;
 /**
  * Holds the session state for a single join code registration.
  * Each account corresponds to one education tenant — join codes are tenant-scoped.
- * Each account gets its own Nethernet server (fresh ID each startup) that redirects
- * to the shared Geyser RakNet port.
+ *
+ * The Nethernet server is shared across all accounts (owned by JoinCodeManager).
+ * All accounts' Discovery registrations point to the same shared nethernet ID,
+ * since Nethernet signaling and Discovery are completely independent systems.
  */
 public class JoinCodeAccount {
     // Auth state (from device code OAuth flow)
@@ -29,7 +30,6 @@ public class JoinCodeAccount {
     volatile @Nullable String upn;
     volatile @Nullable String humanReadableCode;
     volatile @Nullable DiscoveryClient discoveryClient;
-    volatile @Nullable JoinCodeNetherNetServer netherNetServer;
     volatile boolean active = false;
 
     /**
