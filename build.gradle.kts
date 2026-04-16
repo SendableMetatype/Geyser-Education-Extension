@@ -1,6 +1,5 @@
 plugins {
     java
-    id("com.gradleup.shadow") version "8.3.8"
 }
 
 group = "org.geysermc.extension"
@@ -25,11 +24,15 @@ dependencies {
     compileOnly("org.spongepowered:configurate-yaml:4.1.2")
 
     // Nethernet / WebRTC for join code system.
-    // Forked version with long-running stability fixes (ping task exception handling,
-    // isChannelAlive() accessor, last-message-received tracking).
-    // Netty is pulled in transitively and RELOCATED via Shadow to avoid classloader
-    // conflicts with whatever Netty version the host server (Spigot/Velocity/etc.)
-    // ships. See shadowJar task below.
+    // Forked version with long-running stability fixes.
+    //
+    // Netty handling: we bundle the full kastle-pinned Netty 4.1.130 stack
+    // without shading or exclusions — same approach as MCXboxBroadcast.
+    // Geyser/Spigot/Velocity all ship compatible Netty 4.1.x themselves, and
+    // classloader resolution picks one consistent version at runtime. The
+    // cloudburstmc Bedrock protocol classes (loaded from Geyser's classpath)
+    // reference unshaded io.netty types, so we can't shade without breaking
+    // the Nethernet pipeline — see v2.2.2 post-mortem.
     implementation("com.github.SendableMetatype.NetworkCompatible:netty-transport-nethernet:1.7.0-edugeyser.1")
 
     implementation("dev.kastle.webrtc:webrtc-java:1.0.3")
@@ -43,32 +46,8 @@ dependencies {
 }
 
 tasks.jar {
-    // Disable the default jar — we use shadowJar instead. Shadow produces the
-    // final fat jar with relocated Netty; letting the default run just produces
-    // an extra unused slim jar.
-    enabled = false
-}
-
-tasks.shadowJar {
-    archiveClassifier.set("")  // produces EduGeyser-Extension-<version>.jar directly
-    mergeServiceFiles()
-
-    // Relocate Netty into our own package namespace. This isolates our Netty
-    // from whatever version the host server ships, so the extension works
-    // identically on Spigot (4.1.x), Velocity (4.1.x/4.2.x), BungeeCord, and
-    // any future platform regardless of their Netty version.
-    //
-    // JNI note: kastle's webrtc-java JNI bindings use kastle's own package
-    // names (dev.kastle.webrtc.*), NOT Netty class names, so relocating Netty
-    // does not affect JNI resolution.
-    relocate("io.netty", "org.geysermc.extension.edugeyser.shaded.netty")
-
-    // Drop native-image config files — they reference the original io.netty
-    // names, not the relocated ones, and would just sit as dead weight.
-    exclude("META-INF/native-image/**")
-    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
-}
-
-tasks.assemble {
-    dependsOn(tasks.shadowJar)
+    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) }) {
+        exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
