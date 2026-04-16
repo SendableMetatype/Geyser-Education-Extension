@@ -27,7 +27,25 @@ dependencies {
     // Forked version with long-running stability fixes (ping task exception handling,
     // isChannelAlive() accessor, last-message-received tracking).
     implementation("com.github.SendableMetatype.NetworkCompatible:netty-transport-nethernet:1.7.0-edugeyser.1") {
-        exclude(group = "io.netty")  // Use Geyser's bundled Netty
+        // Exclude core Netty modules provided by Geyser/server runtime.
+        // Keep netty-codec-http — needed for WebSocket signaling, NOT provided by Spigot.
+        exclude(group = "io.netty", module = "netty-transport")
+        exclude(group = "io.netty", module = "netty-buffer")
+        exclude(group = "io.netty", module = "netty-codec")
+        exclude(group = "io.netty", module = "netty-handler")
+        exclude(group = "io.netty", module = "netty-common")
+        exclude(group = "io.netty", module = "netty-resolver")
+        exclude(group = "io.netty", module = "netty-transport-native-unix-common")
+    }
+    // Pin netty-codec-http to match Geyser's Netty version (4.2.x) since kastle
+    // ships 4.1.x and the core Netty at runtime will be Geyser's 4.2.x.
+    implementation("io.netty:netty-codec-http:4.2.7.Final") {
+        // Its transitive deps (netty-codec, netty-buffer, etc.) come from Geyser
+        exclude(group = "io.netty", module = "netty-codec")
+        exclude(group = "io.netty", module = "netty-buffer")
+        exclude(group = "io.netty", module = "netty-common")
+        exclude(group = "io.netty", module = "netty-handler")
+        exclude(group = "io.netty", module = "netty-transport")
     }
     implementation("dev.kastle.webrtc:webrtc-java:1.0.3")
     listOf("windows-x86_64", "windows-aarch64", "linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64").forEach { platform ->
