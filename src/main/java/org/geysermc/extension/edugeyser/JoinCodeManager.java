@@ -74,6 +74,7 @@ public class JoinCodeManager {
     private String worldName = "Education Server";
     private String hostName = "EduGeyser";
     private String serverIp = "";
+    private int serverPort = -1;
     private int maxPlayers = 40;
 
     public JoinCodeManager(EduGeyserExtension extension) {
@@ -334,22 +335,9 @@ public class JoinCodeManager {
                     return false;
                 }
 
-                String transferIp;
-                int port;
-                int lastColon = serverIp.lastIndexOf(':');
-                if (lastColon > 0) {
-                    transferIp = serverIp.substring(0, lastColon);
-                    try {
-                        port = Integer.parseInt(serverIp.substring(lastColon + 1));
-                    } catch (NumberFormatException e) {
-                        port = extension.geyserApi().bedrockListener().port();
-                    }
-                } else {
-                    transferIp = serverIp;
-                    port = extension.geyserApi().bedrockListener().port();
-                }
+                int port = serverPort > 0 ? serverPort : extension.geyserApi().bedrockListener().port();
                 netherNetServer = new JoinCodeNetherNetServer(
-                        extension.logger(), getBedrockCodec(), transferIp, port);
+                        extension.logger(), getBedrockCodec(), serverIp, port);
 
                 long started = netherNetServer.start(mcToken, netherNetId);
                 if (started == -1) {
@@ -662,10 +650,11 @@ public class JoinCodeManager {
                         "# Host name shown to joining clients.\n" +
                         "host-name: \"EduGeyser\"\n\n" +
                         "# Public IP or hostname for the TransferPacket (e.g. \"mc.example.com\").\n" +
-                        "# If the port players connect with differs from the port in Geyser's config,\n" +
-                        "# include it as ip:port (e.g. \"mc.example.com:19132\" when using playit.gg).\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
+                        "# Port players connect with. Leave empty to use Geyser's port.\n" +
+                        "# Only set this if the external port differs from Geyser's (e.g. when using playit.gg).\n" +
+                        "server-port: \"\"\n\n" +
                         "# Connection ID. All join codes across all tenants point to this.\n" +
                         "# Clients can also enter this ID directly in Education Edition's\n" +
                         "# connection dialog to join cross-tenant, bypassing join codes.\n" +
@@ -690,6 +679,8 @@ public class JoinCodeManager {
             worldName = node.node("world-name").getString("Education Server");
             hostName = node.node("host-name").getString("EduGeyser");
             serverIp = node.node("server-ip").getString("");
+            String portStr = node.node("server-port").getString("");
+            serverPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
             // Prefer new key; fall back to old key for existing installs
             long legacyId = node.node("nethernet-id").getLong(0);
             netherNetId = node.node("connection-id").getLong(legacyId);
@@ -704,8 +695,7 @@ public class JoinCodeManager {
 
         String detectedIp = detectPublicIp();
         if (detectedIp != null) {
-            int port = extension.geyserApi().bedrockListener().port();
-            serverIp = detectedIp.contains(":") ? "[" + detectedIp + "]:" + port : detectedIp + ":" + port;
+            serverIp = detectedIp;
             extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + serverIp);
         } else {
             extension.logger().warning(LOG_PREFIX + "Could not detect public IP. Set server-ip in joincode_config.yml");

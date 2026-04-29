@@ -67,24 +67,17 @@ public class MessServerListManager {
     public void initialize() {
         loadAllAccounts();
 
-        // Resolve IP:port — use port from config if provided, otherwise Geyser's port
+        // Resolve IP and port separately
         if (globalServerIp == null || globalServerIp.isEmpty()) {
             String detectedIp = detectPublicIp();
             if (detectedIp != null) {
-                int port = extension.geyserApi().bedrockListener().port();
-                globalServerIp = formatIpPort(detectedIp, port);
+                globalServerIp = detectedIp;
                 extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + globalServerIp);
             }
-        } else {
-            int lastColon = globalServerIp.lastIndexOf(':');
-            if (lastColon > 0) {
-                // Config includes a port — use it as-is (supports tunneling setups)
-                // formatIpPort not needed; the value is already ip:port
-            } else {
-                // No port in config — append Geyser's port
-                int port = extension.geyserApi().bedrockListener().port();
-                globalServerIp = formatIpPort(globalServerIp, port);
-            }
+        }
+        int port = globalServerPort > 0 ? globalServerPort : extension.geyserApi().bedrockListener().port();
+        if (globalServerIp != null && !globalServerIp.isEmpty()) {
+            globalServerIp = formatIpPort(globalServerIp, port);
         }
 
         // Start auth flows for existing accounts
@@ -619,6 +612,7 @@ public class MessServerListManager {
     // Global config shared by all accounts
     private String globalServerName = "";
     private String globalServerIp = "";
+    private int globalServerPort = -1;
     private int globalMaxPlayers = 40;
 
     private void loadGlobalConfig() {
@@ -631,10 +625,11 @@ public class MessServerListManager {
                         "# Display name shown in the Education Edition server list.\n" +
                         "server-name: \"\"\n\n" +
                         "# Public IP or hostname (e.g. \"mc.example.com\").\n" +
-                        "# If the port players connect with differs from the port in Geyser's config,\n" +
-                        "# include it as ip:port (e.g. \"mc.example.com:19132\" when using playit.gg).\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
+                        "# Port players connect with. Leave empty to use Geyser's port.\n" +
+                        "# Only set this if the external port differs from Geyser's (e.g. when using playit.gg).\n" +
+                        "server-port: \"\"\n\n" +
                         "# Maximum players shown in the server list.\n" +
                         "max-players: 40\n");
             } catch (IOException e) {
@@ -648,6 +643,8 @@ public class MessServerListManager {
             var node = loader.load();
             globalServerName = node.node("server-name").getString("");
             globalServerIp = node.node("server-ip").getString("");
+            String portStr = node.node("server-port").getString("");
+            globalServerPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
             globalMaxPlayers = node.node("max-players").getInt(40);
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
