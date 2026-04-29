@@ -334,8 +334,20 @@ public class JoinCodeManager {
                     return false;
                 }
 
-                int port = extension.geyserApi().bedrockListener().port();
-                String transferIp = serverIp.contains(":") ? serverIp.substring(0, serverIp.lastIndexOf(':')) : serverIp;
+                String transferIp;
+                int port;
+                int lastColon = serverIp.lastIndexOf(':');
+                if (lastColon > 0) {
+                    transferIp = serverIp.substring(0, lastColon);
+                    try {
+                        port = Integer.parseInt(serverIp.substring(lastColon + 1));
+                    } catch (NumberFormatException e) {
+                        port = extension.geyserApi().bedrockListener().port();
+                    }
+                } else {
+                    transferIp = serverIp;
+                    port = extension.geyserApi().bedrockListener().port();
+                }
                 netherNetServer = new JoinCodeNetherNetServer(
                         extension.logger(), getBedrockCodec(), transferIp, port);
 
@@ -650,7 +662,8 @@ public class JoinCodeManager {
                         "# Host name shown to joining clients.\n" +
                         "host-name: \"EduGeyser\"\n\n" +
                         "# Public IP or hostname for the TransferPacket (e.g. \"mc.example.com\").\n" +
-                        "# Port is always read from Geyser automatically.\n" +
+                        "# If the port players connect with differs from the port in Geyser's config,\n" +
+                        "# include it as ip:port (e.g. \"mc.example.com:19132\" when using playit.gg).\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
                         "# Connection ID. All join codes across all tenants point to this.\n" +

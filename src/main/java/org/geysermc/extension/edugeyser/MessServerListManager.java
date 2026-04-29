@@ -67,18 +67,24 @@ public class MessServerListManager {
     public void initialize() {
         loadAllAccounts();
 
-        // Resolve IP:port — always use Geyser's port, only IP from config or auto-detect
-        int port = extension.geyserApi().bedrockListener().port();
+        // Resolve IP:port — use port from config if provided, otherwise Geyser's port
         if (globalServerIp == null || globalServerIp.isEmpty()) {
             String detectedIp = detectPublicIp();
             if (detectedIp != null) {
+                int port = extension.geyserApi().bedrockListener().port();
                 globalServerIp = formatIpPort(detectedIp, port);
                 extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + globalServerIp);
             }
         } else {
-            // Strip any port from config value, always use Geyser's port
-            String ip = globalServerIp.contains(":") ? globalServerIp.substring(0, globalServerIp.lastIndexOf(':')) : globalServerIp;
-            globalServerIp = formatIpPort(ip, port);
+            int lastColon = globalServerIp.lastIndexOf(':');
+            if (lastColon > 0) {
+                // Config includes a port — use it as-is (supports tunneling setups)
+                // formatIpPort not needed; the value is already ip:port
+            } else {
+                // No port in config — append Geyser's port
+                int port = extension.geyserApi().bedrockListener().port();
+                globalServerIp = formatIpPort(globalServerIp, port);
+            }
         }
 
         // Start auth flows for existing accounts
@@ -625,7 +631,8 @@ public class MessServerListManager {
                         "# Display name shown in the Education Edition server list.\n" +
                         "server-name: \"\"\n\n" +
                         "# Public IP or hostname (e.g. \"mc.example.com\").\n" +
-                        "# Port is always read from Geyser automatically.\n" +
+                        "# If the port players connect with differs from the port in Geyser's config,\n" +
+                        "# include it as ip:port (e.g. \"mc.example.com:19132\" when using playit.gg).\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
                         "# Maximum players shown in the server list.\n" +
