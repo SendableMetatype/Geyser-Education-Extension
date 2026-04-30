@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "org.geysermc.extension"
-version = "2.3.0"
+version = "2.4.0"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -21,7 +21,7 @@ repositories {
 dependencies {
     compileOnly("org.geysermc.geyser:api:2.6.1-SNAPSHOT")
     compileOnly("org.geysermc.geyser:core:2.6.1-SNAPSHOT")
-    compileOnly("org.spongepowered:configurate-yaml:4.1.2")
+    implementation("org.spongepowered:configurate-yaml:4.1.2")
 
     // Nethernet / WebRTC for join code system.
     // Forked version with long-running stability fixes.
