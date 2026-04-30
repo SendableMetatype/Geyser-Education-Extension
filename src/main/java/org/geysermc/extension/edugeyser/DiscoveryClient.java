@@ -50,13 +50,13 @@ public class DiscoveryClient {
      * @param maxPlayers max player count
      * @return the parsed join code string (e.g. "Book, Balloon, Rail, Alex"), or null on failure
      */
-    public @Nullable String host(long nethernetId, String serverName, String serverDetails, int maxPlayers) {
+    public @Nullable String host(String nethernetId, String serverName, String serverDetails, int maxPlayers) {
         try {
             JsonObject body = new JsonObject();
             body.addProperty("build", BUILD_NUMBER);
             body.addProperty("locale", "en_US");
             body.addProperty("maxPlayers", maxPlayers);
-            body.addProperty("networkId", String.valueOf(nethernetId));
+            body.addProperty("networkId", nethernetId);
             body.addProperty("playerCount", 1);
             body.addProperty("protocolVersion", 1);
             body.addProperty("serverDetails", serverDetails);

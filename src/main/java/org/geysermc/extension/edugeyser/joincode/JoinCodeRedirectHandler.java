@@ -129,7 +129,7 @@ public class JoinCodeRedirectHandler implements BedrockPacketHandler {
 
     @Override
     public PacketSignal handle(ClientToServerHandshakePacket packet) {
-        // Client accepted the handshake — continue with login success
+        // Client accepted the handshake. Continue with login success.
         PlayStatusPacket status = new PlayStatusPacket();
         status.setStatus(PlayStatusPacket.Status.LOGIN_SUCCESS);
         session.sendPacket(status);

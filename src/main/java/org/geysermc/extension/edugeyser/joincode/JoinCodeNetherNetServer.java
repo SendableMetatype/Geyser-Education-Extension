@@ -7,12 +7,10 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
-import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.geysermc.geyser.api.extension.ExtensionLogger;
 
 import java.net.InetSocketAddress;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -36,7 +34,7 @@ public class JoinCodeNetherNetServer {
     private EventLoopGroup workerGroup;
     private Channel netherNetChannel;
     private NetherNetXboxSignaling signaling;
-    private long netherNetId;
+    private String netherNetId;
 
     public JoinCodeNetherNetServer(ExtensionLogger logger, BedrockCodec codec,
                                     String transferAddress, int transferPort) {
@@ -47,35 +45,26 @@ public class JoinCodeNetherNetServer {
     }
 
     /**
-     * Starts the Nethernet server with the given MCToken for signaling authentication.
+     * Starts the Nethernet server with a specific nethernetId.
      * @param mcTokenHeader the MCToken authorization header (e.g. "MCToken eyJ...")
-     * @return the nethernetID to register with Discovery, or -1 on failure
+     * @param netherNetId the nethernet ID (decimal string, 5-19 digits)
+     * @return true if the server started successfully
      */
-    public long start(String mcTokenHeader) {
-        return start(mcTokenHeader, generateNetherNetId());
-    }
-
-    /**
-     * Starts the Nethernet server with a specific nethernetId (for session restore).
-     * @param mcTokenHeader the MCToken authorization header
-     * @param netherNetId the nethernetId to reuse
-     * @return the nethernetID, or -1 on failure
-     */
-    public long start(String mcTokenHeader, long netherNetId) {
+    public boolean start(String mcTokenHeader, String netherNetId) {
         shutdown();
         this.netherNetId = netherNetId;
         if (!bindInternal(mcTokenHeader)) {
             shutdown();
-            return -1;
+            return false;
         }
         logger.debug("[JoinCode] Nethernet server started on ID: " + netherNetId);
-        return netherNetId;
+        return true;
     }
 
     /**
      * Rebuilds the signaling WebSocket and Netty channel with a fresh
      * {@link PeerConnectionFactory}, keeping the same nethernetID. Existing
-     * WebRTC peer connections are unaffected — they don't go through signaling
+     * WebRTC peer connections are unaffected since they don't go through signaling
      * after initial negotiation.
      *
      * Note: {@link NetherNetServerChannel#doClose()} calls {@code factory.dispose()},
@@ -91,7 +80,7 @@ public class JoinCodeNetherNetServer {
     }
 
     private boolean bindInternal(String mcTokenHeader) {
-        // Create a fresh PeerConnectionFactory — the channel will dispose it on close.
+        // Create a fresh PeerConnectionFactory. The channel will dispose it on close.
         PeerConnectionFactory factory = new PeerConnectionFactory();
         this.signaling = new NetherNetXboxSignaling(netherNetId, mcTokenHeader);
         this.bossGroup = new NioEventLoopGroup(1);
@@ -126,7 +115,7 @@ public class JoinCodeNetherNetServer {
             netherNetChannel = null;
         }
         signaling = null;
-        // Zero quiet period — we're not draining traffic, just shutting down.
+        // Zero quiet period. We're not draining traffic, just shutting down.
         // Wait synchronously so the native WebRTC library has fully released its
         // resources before bindInternal creates a new PeerConnectionFactory.
         if (bossGroup != null) {
@@ -142,7 +131,7 @@ public class JoinCodeNetherNetServer {
     /**
      * Checks if the upstream signaling WebSocket to Microsoft is still alive.
      * Uses the patched library's public {@code isChannelAlive()} accessor.
-     * Only detects cleanly-closed channels — for stricter checking pass a
+     * Only detects cleanly-closed channels. For stricter checking, pass a
      * silence threshold.
      */
     public boolean isSignalingAlive() {
@@ -174,22 +163,11 @@ public class JoinCodeNetherNetServer {
         closeChannel();
     }
 
-    public long getNetherNetId() {
+    public String getNetherNetId() {
         return netherNetId;
     }
 
     public boolean isRunning() {
         return netherNetChannel != null && netherNetChannel.isActive();
-    }
-
-    /**
-     * Generate a random Nethernet ID (uint64, first digit nonzero).
-     */
-    private static long generateNetherNetId() {
-        long id;
-        do {
-            id = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
-        } while (id <= 0 || String.valueOf(id).charAt(0) == '0');
-        return id;
     }
 }

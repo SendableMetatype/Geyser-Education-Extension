@@ -10,7 +10,7 @@ import java.util.Base64;
 /**
  * Holds the session state for a single MESS server list registration.
  * Each account corresponds to one Global Admin M365 tenant.
- * Global config (server-name, server-ip, max-players) is NOT stored here —
+ * Global config (server-name, server-ip, max-players) is NOT stored here -
  * it lives in serverlist_config.yml and is read by MessServerListManager.
  */
 public class ServerListAccount {

@@ -25,13 +25,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 /**
  * Manages Education Edition join codes (multi-account).
  *
  * Architecture: one shared Nethernet server with a stable nethernet ID, plus
  * one Discovery registration per education tenant. Nethernet signaling and
- * Discovery are independent systems — Discovery maps join codes to nethernet
+ * Discovery are independent systems. Discovery maps join codes to nethernet
  * IDs, the Nethernet signaling server just routes WebRTC connections. So we
  * run ONE signaling connection and point all tenant join codes at it.
  *
@@ -52,7 +53,7 @@ public class JoinCodeManager {
     private static final long CODE_REMINDER_INTERVAL_SECONDS = 180;
     private static final long SIGNALING_RECONNECT_INTERVAL_SECONDS = 120;
     private static final long FORCED_REBUILD_INTERVAL_SECONDS = 1800; // 30 min safety net
-    private static final long MIN_NETHERNET_ID = 10_000L; // 5-digit minimum to avoid trivial collisions
+    private static final Pattern VALID_NETHERNET_ID = Pattern.compile("^[0-9]{5,19}$");
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
@@ -65,10 +66,10 @@ public class JoinCodeManager {
     private volatile @Nullable ScheduledFuture<?> forcedRebuildTask;
     private volatile boolean shutdownRequested;
 
-    // Shared Nethernet server — one signaling WebSocket, all accounts' Discovery
+    // Shared Nethernet server - one signaling WebSocket, all accounts' Discovery
     // registrations point to this same nethernet ID.
     private volatile @Nullable JoinCodeNetherNetServer netherNetServer;
-    private volatile long netherNetId;
+    private volatile @Nullable String netherNetId;
 
     // Global config shared by all accounts
     private String worldName = "Education Server";
@@ -89,12 +90,15 @@ public class JoinCodeManager {
             Files.createDirectories(extension.dataFolder());
         } catch (IOException e) {
             extension.logger().error(LOG_PREFIX + "Failed to create data folder: " + e.getMessage());
+            return;
         }
-        loadConfig();
+        if (!loadConfig()) {
+            return;
+        }
         resolveServerIp();
         loadAllAccounts();
 
-        // Restore existing accounts — each account's restore path calls
+        // Restore existing accounts. Each account's restore path calls
         // ensureNetherNetServer() lazily, so the shared server only spins up
         // if there's at least one account to host. On a fresh install with no
         // accounts, nothing starts until /edu joincode add is run.
@@ -201,7 +205,7 @@ public class JoinCodeManager {
             throw new IOException("Shared Nethernet server not available");
         }
 
-        // Register with Discovery — points this account's join code at the shared nethernetId.
+        // Register with Discovery. Points this account's join code at the shared nethernetId.
         account.discoveryClient = new DiscoveryClient(extension.logger(), account.accessToken);
 
         String code = account.discoveryClient.host(netherNetId, worldName, hostName, maxPlayers);
@@ -319,11 +323,10 @@ public class JoinCodeManager {
                 return true;
             }
 
-            if (netherNetId < MIN_NETHERNET_ID) {
-                extension.logger().error(LOG_PREFIX + "connection-id in joincode_config.yml is " +
-                        netherNetId + " — must be at least " + MIN_NETHERNET_ID +
-                        " (5 digits) to avoid collisions with other servers. " +
-                        "Delete joincode_config.yml to regenerate a fresh 10-digit ID.");
+            if (netherNetId == null || !VALID_NETHERNET_ID.matcher(netherNetId).matches()) {
+                extension.logger().error(LOG_PREFIX + "connection-id in joincode_config.yml is invalid: " +
+                        netherNetId + " (must be 5 to 19 decimal digits). " +
+                        "Fix the connection-id value in joincode_config.yml and restart.");
                 return false;
             }
 
@@ -339,8 +342,7 @@ public class JoinCodeManager {
                 netherNetServer = new JoinCodeNetherNetServer(
                         extension.logger(), getBedrockCodec(), serverIp, port);
 
-                long started = netherNetServer.start(mcToken, netherNetId);
-                if (started == -1) {
+                if (!netherNetServer.start(mcToken, netherNetId)) {
                     netherNetServer = null;
                     extension.logger().error(LOG_PREFIX + "Failed to start Nethernet server");
                     return false;
@@ -388,12 +390,13 @@ public class JoinCodeManager {
     /**
      * Generate a random nethernet ID. The ID is user-facing (clients can enter
      * it directly to join cross-tenant) so we aim for something tractable.
-     * Real education clients generate 20-digit IDs, but variable lengths work —
+     * Real education clients generate 20-digit IDs, but variable lengths work.
      * we use exactly 10 digits for consistency.
      */
-    private static long generateNetherNetId() {
-        // [1_000_000_000, 10_000_000_000) — always 10 digits
-        return java.util.concurrent.ThreadLocalRandom.current().nextLong(1_000_000_000L, 10_000_000_000L);
+    private static String generateNetherNetId() {
+        // [1_000_000_000, 10_000_000_000) - always 10 digits
+        long value = java.util.concurrent.ThreadLocalRandom.current().nextLong(1_000_000_000L, 10_000_000_000L);
+        return String.valueOf(value);
     }
 
     // ---- Heartbeat (per account) ----
@@ -635,7 +638,7 @@ public class JoinCodeManager {
 
     // ---- Config & Session Persistence ----
 
-    private void loadConfig() {
+    private boolean loadConfig() {
         Path configPath = extension.dataFolder().resolve(CONFIG_FILE);
         if (!Files.exists(configPath)) {
             // First-ever start: generate the nethernet ID now and write it
@@ -660,17 +663,18 @@ public class JoinCodeManager {
                         "# connection dialog to join cross-tenant, bypassing join codes.\n" +
                         "#\n" +
                         "# Recommended: keep this at 10 digits (the generated default).\n" +
-                        "# Do NOT pick predictable numbers like 123456789 or 1111111111 —\n" +
-                        "# someone else running another server could accidentally use the same\n" +
+                        "# Do NOT pick predictable numbers like 123456789 or 1111111111.\n" +
+                        "# Someone else running another server could accidentally use the same\n" +
                         "# ID, causing clients to be routed to the wrong server worldwide.\n" +
-                        "# Minimum enforced length is 5 digits (values below 10000 are rejected).\n" +
-                        "connection-id: " + netherNetId + "\n\n" +
+                        "# Valid range: 5 to 19 digits.\n" +
+                        "connection-id: \"" + netherNetId + "\"\n\n" +
                         "# Maximum players shown.\n" +
                         "max-players: 40\n");
             } catch (IOException e) {
                 extension.logger().error(LOG_PREFIX + "Failed to create config: " + e.getMessage());
+                return false;
             }
-            return;
+            return true;
         }
         try {
             var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
@@ -682,11 +686,15 @@ public class JoinCodeManager {
             String portStr = node.node("server-port").getString("");
             serverPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
             // Prefer new key; fall back to old key for existing installs
-            long legacyId = node.node("nethernet-id").getLong(0);
-            netherNetId = node.node("connection-id").getLong(legacyId);
+            netherNetId = node.node("connection-id").getString();
+            if (netherNetId == null) {
+                netherNetId = node.node("nethernet-id").getString();
+            }
             maxPlayers = node.node("max-players").getInt(40);
+            return true;
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
+            return false;
         }
     }
 

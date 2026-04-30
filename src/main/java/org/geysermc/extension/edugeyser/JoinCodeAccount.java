@@ -9,7 +9,7 @@ import java.util.Base64;
 
 /**
  * Holds the session state for a single join code registration.
- * Each account corresponds to one education tenant — join codes are tenant-scoped.
+ * Each account corresponds to one education tenant. Join codes are tenant-scoped.
  *
  * The Nethernet server is shared across all accounts (owned by JoinCodeManager).
  * All accounts' Discovery registrations point to the same shared nethernet ID,

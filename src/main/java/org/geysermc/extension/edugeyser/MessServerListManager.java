@@ -165,7 +165,7 @@ public class MessServerListManager {
                 completeAuthFlow(account, index);
                 return;
             } catch (InterruptedException e) {
-                // Token refresh failed — clear session and fall through to re-auth
+                // Token refresh failed - clear session and fall through to re-auth
                 extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) + ", re-authenticating...");
                 clearAccountSession(account);
             }
@@ -737,7 +737,7 @@ public class MessServerListManager {
 
     private static String formatIpPort(String ip, int port) {
         if (ip.contains(":")) {
-            // IPv6 — wrap in brackets
+            // IPv6: wrap in brackets
             return "[" + ip + "]:" + port;
         }
         return ip + ":" + port;
