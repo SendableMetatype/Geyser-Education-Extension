@@ -7,28 +7,30 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
-import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.geysermc.geyser.api.extension.ExtensionLogger;
 
 import java.net.InetSocketAddress;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Lightweight Nethernet (WebRTC) server that accepts incoming connections from
- * education clients using join codes and redirects them to Geyser's RakNet port
- * via TransferPacket.
+ * Nethernet (WebRTC) server that accepts incoming connections from education
+ * clients and relays their traffic to the proxy's RakNet listener.
  *
- * The signaling WebSocket is periodically rebuilt via {@link #restartSignaling(String)}
- * to prevent stale/dropped connections from accumulating over long-running sessions.
- * Existing WebRTC peer connections are unaffected since they don't rely on the
- * signaling server after initial negotiation.
+ * Each incoming Nethernet connection gets a transparent byte relay to
+ * the configured Geyser listener host and port. The relay only adds/strips the 0xFE game
+ * packet prefix - all Bedrock protocol handling (compression, encryption,
+ * education-specific packet modifications) is done by Geyser.
+ *
+ * The signaling WebSocket can be rebuilt via {@link #restartSignaling(String)}
+ * if the health check detects a dead connection. Existing WebRTC peer connections
+ * are unaffected since they don't rely on the signaling server after initial
+ * negotiation.
  */
 public class JoinCodeNetherNetServer {
 
     private final ExtensionLogger logger;
-    private final BedrockCodec codec;
-    private final String transferAddress;
-    private final int transferPort;
+    private final String geyserHost;
+    private final int geyserPort;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
@@ -36,12 +38,10 @@ public class JoinCodeNetherNetServer {
     private NetherNetXboxSignaling signaling;
     private String netherNetId;
 
-    public JoinCodeNetherNetServer(ExtensionLogger logger, BedrockCodec codec,
-                                    String transferAddress, int transferPort) {
+    public JoinCodeNetherNetServer(ExtensionLogger logger, String geyserHost, int geyserPort) {
         this.logger = logger;
-        this.codec = codec;
-        this.transferAddress = transferAddress;
-        this.transferPort = transferPort;
+        this.geyserHost = geyserHost;
+        this.geyserPort = geyserPort;
     }
 
     /**
@@ -89,7 +89,7 @@ public class JoinCodeNetherNetServer {
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap.group(bossGroup, workerGroup)
                     .channelFactory(NetherNetChannelFactory.server(factory, signaling))
-                    .childHandler(new JoinCodeChannelInitializer(codec, transferAddress, transferPort, logger));
+                    .childHandler(new JoinCodeChannelInitializer(geyserHost, geyserPort, logger));
             this.netherNetChannel = bootstrap.bind(new InetSocketAddress(0)).sync().channel();
             return true;
         } catch (Exception e) {

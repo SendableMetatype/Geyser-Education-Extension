@@ -3,7 +3,6 @@ package org.geysermc.extension.edugeyser;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.checkerframework.checker.nullness.qual.Nullable;
-import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.geysermc.extension.edugeyser.joincode.JoinCodeNetherNetServer;
 import org.geysermc.geyser.api.command.CommandSource;
 
@@ -52,7 +51,6 @@ public class JoinCodeManager {
     private static final long HEARTBEAT_INTERVAL_SECONDS = 100;
     private static final long CODE_REMINDER_INTERVAL_SECONDS = 180;
     private static final long SIGNALING_RECONNECT_INTERVAL_SECONDS = 120;
-    private static final long FORCED_REBUILD_INTERVAL_SECONDS = 1800; // 30 min safety net
     private static final Pattern VALID_NETHERNET_ID = Pattern.compile("^[0-9]{5,19}$");
 
     private final EduGeyserExtension extension;
@@ -63,7 +61,6 @@ public class JoinCodeManager {
     private final Map<JoinCodeAccount, List<ScheduledFuture<?>>> accountTasks = new ConcurrentHashMap<>();
     private volatile @Nullable ScheduledFuture<?> codeReminderTask;
     private volatile @Nullable ScheduledFuture<?> signalingReconnectTask;
-    private volatile @Nullable ScheduledFuture<?> forcedRebuildTask;
     private volatile boolean shutdownRequested;
 
     // Shared Nethernet server - one signaling WebSocket, all accounts' Discovery
@@ -74,8 +71,6 @@ public class JoinCodeManager {
     // Global config shared by all accounts
     private String worldName = "Education Server";
     private String hostName = "EduGeyser";
-    private String serverIp = "";
-    private int serverPort = -1;
     private int maxPlayers = 40;
 
     public JoinCodeManager(EduGeyserExtension extension) {
@@ -95,13 +90,19 @@ public class JoinCodeManager {
         if (!loadConfig()) {
             return;
         }
-        resolveServerIp();
         loadAllAccounts();
 
-        // Restore existing accounts. Each account's restore path calls
-        // ensureNetherNetServer() lazily, so the shared server only spins up
-        // if there's at least one account to host. On a fresh install with no
-        // accounts, nothing starts until /edu joincode add is run.
+        // Start the Nethernet server unconditionally. It only needs a
+        // connection ID (from config) and an anonymous PlayFab MCToken.
+        // Education accounts are only required for Discovery (join codes),
+        // not for accepting connections via the connection ID directly.
+        if (!ensureNetherNetServer()) {
+            extension.logger().error(LOG_PREFIX + "Nethernet server failed to start. " +
+                    "Connection ID and join codes will not work.");
+        }
+
+        // Restore existing accounts. Each account re-registers with Discovery
+        // to activate its join code. The Nethernet server is already running.
         for (int i = 0; i < accounts.size(); i++) {
             final int idx = i;
             JoinCodeAccount account = accounts.get(i);
@@ -110,14 +111,12 @@ public class JoinCodeManager {
 
         scheduleCodeReminder();
         scheduleSignalingReconnect();
-        scheduleForcedRebuild();
     }
 
     public void shutdown() {
         shutdownRequested = true;
         if (codeReminderTask != null) codeReminderTask.cancel(false);
         if (signalingReconnectTask != null) signalingReconnectTask.cancel(false);
-        if (forcedRebuildTask != null) forcedRebuildTask.cancel(false);
         for (List<ScheduledFuture<?>> tasks : accountTasks.values()) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
@@ -294,18 +293,6 @@ public class JoinCodeManager {
         accounts.remove(account);
         saveAllAccounts();
 
-        // If this was the last account, shut down the shared Nethernet server.
-        // No accounts = no Discovery registrations = no one can reach it anyway.
-        if (accounts.isEmpty()) {
-            synchronized (serverLock) {
-                if (netherNetServer != null) {
-                    netherNetServer.shutdown();
-                    netherNetServer = null;
-                    extension.logger().debug(LOG_PREFIX + "Last account removed, shared Nethernet server stopped");
-                }
-            }
-        }
-
         source.sendMessage(LOG_PREFIX + "Removed join code #" + number +
                 (oldCode != null ? " (" + oldCode + ")" : "") +
                 (" " + account.displayLabel()));
@@ -338,9 +325,13 @@ public class JoinCodeManager {
                     return false;
                 }
 
-                int port = serverPort > 0 ? serverPort : extension.geyserApi().bedrockListener().port();
+                String bindAddress = extension.geyserApi().bedrockListener().address();
+                String geyserHost = (bindAddress == null || bindAddress.isEmpty()
+                        || "0.0.0.0".equals(bindAddress) || "::".equals(bindAddress))
+                        ? "127.0.0.1" : bindAddress;
+                int geyserPort = extension.geyserApi().bedrockListener().port();
                 netherNetServer = new JoinCodeNetherNetServer(
-                        extension.logger(), getBedrockCodec(), serverIp, port);
+                        extension.logger(), geyserHost, geyserPort);
 
                 if (!netherNetServer.start(mcToken, netherNetId)) {
                     netherNetServer = null;
@@ -424,26 +415,15 @@ public class JoinCodeManager {
         signalingReconnectTask = scheduler.scheduleAtFixedRate(() -> {
             if (shutdownRequested) return;
             JoinCodeNetherNetServer server = netherNetServer;
-            if (server == null) return;
+            if (server == null) {
+                ensureNetherNetServer();
+                return;
+            }
             if (server.isSignalingAlive()) return;
 
             extension.logger().info(LOG_PREFIX + "Shared signaling dead, rebuilding...");
             rebuildSharedSignaling("reconnect");
         }, SIGNALING_RECONNECT_INTERVAL_SECONDS, SIGNALING_RECONNECT_INTERVAL_SECONDS, TimeUnit.SECONDS);
-    }
-
-    /**
-     * Forces a shared signaling rebuild every 30 minutes as a safety net, even
-     * if the health check still reports the connection alive. Catches silent
-     * half-closed TCP and any unknown failure modes.
-     */
-    private void scheduleForcedRebuild() {
-        forcedRebuildTask = scheduler.scheduleAtFixedRate(() -> {
-            if (shutdownRequested) return;
-            if (netherNetServer == null) return;
-            extension.logger().debug(LOG_PREFIX + "Forced 30-min shared rebuild");
-            rebuildSharedSignaling("forced");
-        }, FORCED_REBUILD_INTERVAL_SECONDS, FORCED_REBUILD_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
     private void scheduleCodeReminder() {
@@ -594,7 +574,7 @@ public class JoinCodeManager {
 
     /**
      * Temporary test command: force-rebuild the shared Nethernet signaling.
-     * Used to verify the rebuild path works without waiting for the 30-min timer.
+     * Used to verify the rebuild path without waiting for a failed health check.
      */
     private void forceRebuildAll(CommandSource source) {
         JoinCodeNetherNetServer server = netherNetServer;
@@ -652,12 +632,6 @@ public class JoinCodeManager {
                         "world-name: \"Education Server\"\n\n" +
                         "# Host name shown to joining clients.\n" +
                         "host-name: \"EduGeyser\"\n\n" +
-                        "# Public IP or hostname for the TransferPacket (e.g. \"mc.example.com\").\n" +
-                        "# Leave empty to auto-detect.\n" +
-                        "server-ip: \"\"\n\n" +
-                        "# Port players connect with. Leave empty to use Geyser's port.\n" +
-                        "# Only set this if the external port differs from Geyser's (e.g. when using playit.gg).\n" +
-                        "server-port: \"\"\n\n" +
                         "# Connection ID. All join codes across all tenants point to this.\n" +
                         "# Clients can also enter this ID directly in Education Edition's\n" +
                         "# connection dialog to join cross-tenant, bypassing join codes.\n" +
@@ -682,9 +656,6 @@ public class JoinCodeManager {
             var node = loader.load();
             worldName = node.node("world-name").getString("Education Server");
             hostName = node.node("host-name").getString("EduGeyser");
-            serverIp = node.node("server-ip").getString("");
-            String portStr = node.node("server-port").getString("");
-            serverPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
             // Prefer new key; fall back to old key for existing installs
             netherNetId = node.node("connection-id").getString();
             if (netherNetId == null) {
@@ -696,38 +667,6 @@ public class JoinCodeManager {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
             return false;
         }
-    }
-
-    private void resolveServerIp() {
-        if (serverIp != null && !serverIp.isEmpty()) return;
-
-        String detectedIp = detectPublicIp();
-        if (detectedIp != null) {
-            serverIp = detectedIp;
-            extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + serverIp);
-        } else {
-            extension.logger().warning(LOG_PREFIX + "Could not detect public IP. Set server-ip in joincode_config.yml");
-        }
-    }
-
-    private @Nullable String detectPublicIp() {
-        for (String service : new String[]{"https://checkip.amazonaws.com", "https://api.ipify.org", "https://icanhazip.com"}) {
-            HttpURLConnection con = null;
-            try {
-                con = (HttpURLConnection) URI.create(service).toURL().openConnection();
-                con.setRequestMethod("GET");
-                con.setConnectTimeout(5000);
-                con.setReadTimeout(5000);
-                if (con.getResponseCode() == 200) {
-                    String ip = readStream(con.getInputStream()).trim();
-                    if (!ip.isEmpty() && ip.length() < 46) return ip;
-                }
-            } catch (Exception ignored) {
-            } finally {
-                if (con != null) con.disconnect();
-            }
-        }
-        return null;
     }
 
     private void loadAllAccounts() {
@@ -792,13 +731,6 @@ public class JoinCodeManager {
         account.humanReadableCode = null;
         account.active = false;
         saveAllAccounts();
-    }
-
-    // ---- Codec Helper ----
-
-    private BedrockCodec getBedrockCodec() {
-        return org.geysermc.extension.edugeyser.joincode.EducationRedirectCodec.wrap(
-                org.cloudburstmc.protocol.bedrock.codec.v944.Bedrock_v944.CODEC);
     }
 
     // ---- HTTP Helpers ----

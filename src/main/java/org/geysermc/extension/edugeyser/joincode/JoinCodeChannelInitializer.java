@@ -1,35 +1,31 @@
 package org.geysermc.extension.edugeyser.joincode;
 
-import org.cloudburstmc.protocol.bedrock.BedrockPeer;
-import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
-import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInitializer;
 import org.geysermc.geyser.api.extension.ExtensionLogger;
 
 /**
  * Channel initializer for incoming Nethernet connections from join code clients.
- * Sets up the redirect handler that transfers clients to Geyser's RakNet port.
+ * Sets up a transparent byte relay to the proxy's RakNet listener.
+ *
+ * No Bedrock protocol codecs are added - the relay forwards raw bytes between
+ * the Nethernet data channel and a RakNet client connection, only adding or
+ * stripping the 0xFE game packet prefix.
  */
-public class JoinCodeChannelInitializer extends NetherNetBedrockChannelInitializer<BedrockServerSession> {
+public class JoinCodeChannelInitializer extends ChannelInitializer<Channel> {
 
-    private final BedrockCodec codec;
-    private final String transferAddress;
-    private final int transferPort;
+    private final String geyserHost;
+    private final int geyserPort;
     private final ExtensionLogger logger;
 
-    public JoinCodeChannelInitializer(BedrockCodec codec, String transferAddress, int transferPort, ExtensionLogger logger) {
-        this.codec = codec;
-        this.transferAddress = transferAddress;
-        this.transferPort = transferPort;
+    public JoinCodeChannelInitializer(String geyserHost, int geyserPort, ExtensionLogger logger) {
+        this.geyserHost = geyserHost;
+        this.geyserPort = geyserPort;
         this.logger = logger;
     }
 
     @Override
-    protected BedrockServerSession createSession0(BedrockPeer peer, int subClientId) {
-        return new BedrockServerSession(peer, subClientId);
-    }
-
-    @Override
-    protected void initSession(BedrockServerSession session) {
-        session.setPacketHandler(new JoinCodeRedirectHandler(session, codec, transferAddress, transferPort, logger));
+    protected void initChannel(Channel channel) {
+        channel.pipeline().addLast("relay", new NetherNetRelayHandler(geyserHost, geyserPort, logger));
     }
 }
