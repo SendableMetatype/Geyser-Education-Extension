@@ -11,6 +11,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -49,6 +50,14 @@ public class MessServerListManager {
     private static final int HTTP_TIMEOUT = 15000;
     private static final long TOKEN_EXPIRY_BUFFER_SECONDS = 60;
     private static final int MESS_HEALTH_OPTIMAL = 2;
+    private static final String[] PUBLIC_IP_SERVICES = {
+            "https://checkip.amazonaws.com",
+            "https://api.ipify.org",
+            "https://icanhazip.com",
+            "https://ifconfig.me/ip",
+            "https://ipv4.icanhazip.com",
+            "https://ipinfo.io/ip"
+    };
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
@@ -56,6 +65,7 @@ public class MessServerListManager {
     private final List<ServerListAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<ServerListAccount, List<ScheduledFuture<?>>> accountTasks = new java.util.concurrent.ConcurrentHashMap<>();
     private volatile boolean shutdownRequested;
+    private volatile boolean serverListEndpointAvailable = true;
 
     public MessServerListManager(EduGeyserExtension extension) {
         this.extension = extension;
@@ -67,17 +77,10 @@ public class MessServerListManager {
     public void initialize() {
         loadAllAccounts();
 
-        // Resolve IP and port separately
-        if (globalServerIp == null || globalServerIp.isEmpty()) {
-            String detectedIp = detectPublicIp();
-            if (detectedIp != null) {
-                globalServerIp = detectedIp;
-                extension.logger().debug(LOG_PREFIX + "Auto-detected server IP: " + globalServerIp);
-            }
-        }
-        int port = globalServerPort > 0 ? globalServerPort : extension.geyserApi().bedrockListener().port();
-        if (globalServerIp != null && !globalServerIp.isEmpty()) {
-            globalServerIp = formatIpPort(globalServerIp, port);
+        if (!resolveServerListEndpoint()) {
+            extension.logger().error(LOG_PREFIX + "Could not auto-detect a public server IP. " +
+                    "Server list registration is disabled until server-ip is set in serverlist_config.yml.");
+            return;
         }
 
         // Start auth flows for existing accounts
@@ -185,6 +188,11 @@ public class MessServerListManager {
     // ---- Add Account (command-triggered) ----
 
     public void addAccount(CommandSource source) {
+        if (!serverListEndpointAvailable) {
+            source.sendMessage(LOG_PREFIX + "Server list registration is disabled until server-ip is set in serverlist_config.yml.");
+            return;
+        }
+
         ServerListAccount account = new ServerListAccount();
         int index = accounts.size();
         accounts.add(account);
@@ -479,6 +487,10 @@ public class MessServerListManager {
     // ---- Host / Dehost / Update ----
 
     private void hostServer(ServerListAccount account) throws IOException {
+        if (globalServerIp == null || globalServerIp.isEmpty()) {
+            throw new IOException("No server list endpoint configured or detected. Set server-ip in serverlist_config.yml.");
+        }
+
         JsonObject transportInfo = new JsonObject();
         transportInfo.addProperty("ip", globalServerIp);
         JsonObject connectionInfo = new JsonObject();
@@ -614,6 +626,8 @@ public class MessServerListManager {
     private String globalServerIp = "";
     private int globalServerPort = -1;
     private int globalMaxPlayers = 40;
+    private boolean globalServerIpConfigured;
+    private boolean globalServerPortConfigured;
 
     private void loadGlobalConfig() {
         Path configPath = getConfigPath();
@@ -642,9 +656,13 @@ public class MessServerListManager {
                     .path(configPath).build();
             var node = loader.load();
             globalServerName = node.node("server-name").getString("");
-            globalServerIp = node.node("server-ip").getString("");
-            String portStr = node.node("server-port").getString("");
+            String configuredIp = node.node("server-ip").getString("");
+            globalServerIp = configuredIp == null ? "" : configuredIp.trim();
+            globalServerIpConfigured = !globalServerIp.isEmpty();
+            String configuredPort = node.node("server-port").getString("");
+            String portStr = configuredPort == null ? "" : configuredPort.trim();
             globalServerPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
+            globalServerPortConfigured = !portStr.isEmpty();
             globalMaxPlayers = node.node("max-players").getInt(40);
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
@@ -692,6 +710,32 @@ public class MessServerListManager {
                 extension.logger().error(LOG_PREFIX + "Failed to load sessions: " + e.getMessage());
             }
         }
+    }
+
+    private boolean resolveServerListEndpoint() {
+        String host = globalServerIp == null ? "" : globalServerIp.trim();
+        if (host.isEmpty()) {
+            host = detectPublicIp();
+            if (host == null) {
+                serverListEndpointAvailable = false;
+                globalServerIp = "";
+                return false;
+            }
+            globalServerIp = host;
+        }
+
+        int port = globalServerPort > 0 ? globalServerPort : extension.geyserApi().bedrockListener().port();
+        globalServerIp = formatIpPort(host, port);
+        serverListEndpointAvailable = true;
+
+        if (globalServerIpConfigured && globalServerPortConfigured) {
+            extension.logger().info(LOG_PREFIX + "Using configured server list endpoint: " + globalServerIp);
+        } else {
+            extension.logger().warning(LOG_PREFIX + "Using inferred server list endpoint: " + globalServerIp +
+                    ". This probably works, but may cause connection issues if the public address or external port differs. " +
+                    "Set server-ip and server-port in serverlist_config.yml for reliable server list registration.");
+        }
+        return true;
     }
 
     private void saveAllAccounts() {
@@ -755,7 +799,7 @@ public class MessServerListManager {
     // ---- IP Detection ----
 
     private @Nullable String detectPublicIp() {
-        for (String service : new String[]{"https://checkip.amazonaws.com", "https://api.ipify.org", "https://icanhazip.com"}) {
+        for (String service : PUBLIC_IP_SERVICES) {
             HttpURLConnection con = null;
             try {
                 con = (HttpURLConnection) URI.create(service).toURL().openConnection();
@@ -764,7 +808,7 @@ public class MessServerListManager {
                 con.setReadTimeout(5000);
                 if (con.getResponseCode() == 200) {
                     String ip = readStream(con.getInputStream()).trim();
-                    if (!ip.isEmpty() && ip.length() < 46) return ip;
+                    if (isValidDetectedIp(ip)) return ip;
                 }
             } catch (Exception ignored) {
             } finally {
@@ -772,6 +816,22 @@ public class MessServerListManager {
             }
         }
         return null;
+    }
+
+    private static boolean isValidDetectedIp(String ip) {
+        if (ip == null || ip.isEmpty() || ip.length() > 45 || ip.chars().anyMatch(Character::isWhitespace)) {
+            return false;
+        }
+        try {
+            InetAddress address = InetAddress.getByName(ip);
+            return !address.isAnyLocalAddress()
+                    && !address.isLoopbackAddress()
+                    && !address.isLinkLocalAddress()
+                    && !address.isSiteLocalAddress()
+                    && !address.isMulticastAddress();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ---- HTTP Helpers ----
