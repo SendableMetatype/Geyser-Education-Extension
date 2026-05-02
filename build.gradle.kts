@@ -19,8 +19,8 @@ repositories {
 }
 
 dependencies {
-    compileOnly("org.geysermc.geyser:api:2.6.1-SNAPSHOT")
-    compileOnly("org.geysermc.geyser:core:2.6.1-SNAPSHOT")
+    compileOnly("com.github.SendableMetatype.EduGeyser:api:master-SNAPSHOT")
+    compileOnly("com.github.SendableMetatype.EduGeyser:core:master-SNAPSHOT")
     implementation("org.spongepowered:configurate-yaml:4.1.2")
 
     // Nethernet / WebRTC for join code system.
@@ -40,7 +40,7 @@ dependencies {
         runtimeOnly("dev.kastle.webrtc:webrtc-java:1.0.3:$platform")
     }
 
-    // Bedrock protocol for the redirect handler (match Geyser's version)
+    // Bedrock protocol classes provided by EduGeyser at runtime.
     compileOnly("org.cloudburstmc.protocol:bedrock-connection:3.0.0.Beta12-20260316.225858-10")
     compileOnly("org.cloudburstmc.protocol:bedrock-codec:3.0.0.Beta12-20260316.225858-10")
 }

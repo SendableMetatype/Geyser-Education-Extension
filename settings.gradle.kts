@@ -4,8 +4,8 @@ val geyserForkDir = file("../GeyserFork")
 if (geyserForkDir.isDirectory) {
     includeBuild(geyserForkDir) {
         dependencySubstitution {
-            substitute(module("org.geysermc.geyser:api")).using(project(":api"))
-            substitute(module("org.geysermc.geyser:core")).using(project(":core"))
+            substitute(module("com.github.SendableMetatype.EduGeyser:api")).using(project(":api"))
+            substitute(module("com.github.SendableMetatype.EduGeyser:core")).using(project(":core"))
         }
     }
 }
