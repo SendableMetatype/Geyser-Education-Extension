@@ -129,31 +129,31 @@ public class MessServerListManager {
         }
     }
 
-    private void completeAuthFlow(ServerListAccount account, int index) {
-        try {
-            if (account.serverId != null && !account.serverId.isEmpty()) {
-                fetchServerToken(account);
-            } else {
-                registerNewServer(account);
-                extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
-            }
-
-            tryEditTenantSettings(account);
-            hostServer(account);
-            tryEditServerInfo(account);
-            account.extractTenantId();
-            account.active = true;
-            saveAllAccounts();
-
-            extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " hosted at " + globalServerIp +
-                    " (" + account.displayLabel() + ")");
-
-            if (shutdownRequested) return;
-            scheduleServerUpdates(account);
-            scheduleTokenRefresh(account);
-        } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Auth flow failed for account #" + (index + 1) + ": " + e.getMessage());
+    /**
+     * Completes the auth flow by registering/hosting the server.
+     * Throws on failure so callers can distinguish success from failure.
+     */
+    private void completeAuthFlow(ServerListAccount account, int index) throws Exception {
+        if (account.serverId != null && !account.serverId.isEmpty()) {
+            fetchServerToken(account);
+        } else {
+            registerNewServer(account);
+            extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
         }
+
+        tryEditTenantSettings(account);
+        hostServer(account);
+        tryEditServerInfo(account);
+        account.extractTenantId();
+        account.active = true;
+        saveAllAccounts();
+
+        extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " hosted at " + globalServerIp +
+                " (" + account.displayLabel() + ")");
+
+        if (shutdownRequested) return;
+        scheduleServerUpdates(account);
+        scheduleTokenRefresh(account);
     }
 
     private void restoreOrAuthenticate(ServerListAccount account, int index) throws IOException, InterruptedException {
@@ -167,9 +167,9 @@ public class MessServerListManager {
                 extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) + " (" + account.displayLabel() + ")");
                 completeAuthFlow(account, index);
                 return;
-            } catch (InterruptedException e) {
-                // Token refresh failed - clear session and fall through to re-auth
-                extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) + ", re-authenticating...");
+            } catch (Exception e) {
+                // Token refresh or hosting failed - clear session and fall through to re-auth
+                extension.logger().warning(LOG_PREFIX + "Restore failed for account #" + (index + 1) + ", re-authenticating...");
                 clearAccountSession(account);
             }
         }
@@ -179,7 +179,13 @@ public class MessServerListManager {
             clearAccountSession(account);
         }
 
-        doDeviceCodeFlows(account, index).thenRun(() -> completeAuthFlow(account, index)).exceptionally(ex -> {
+        doDeviceCodeFlows(account, index).thenRun(() -> {
+            try {
+                completeAuthFlow(account, index);
+            } catch (Exception e) {
+                extension.logger().error(LOG_PREFIX + "Auth flow failed for account #" + (index + 1) + ": " + e.getMessage());
+            }
+        }).exceptionally(ex -> {
             extension.logger().error(LOG_PREFIX + "Auth failed for account #" + (index + 1) + ": " + ex.getMessage());
             return null;
         });
@@ -200,9 +206,15 @@ public class MessServerListManager {
 
         scheduler.execute(() -> {
             doDeviceCodeFlows(account, index).thenRun(() -> {
-                completeAuthFlow(account, index);
-                source.sendMessage(LOG_PREFIX + "Account #" + (index + 1) + " registered successfully!" +
-                        " Tenant: " + account.displayLabel());
+                try {
+                    completeAuthFlow(account, index);
+                    source.sendMessage(LOG_PREFIX + "Account #" + (index + 1) + " registered successfully!" +
+                            " Tenant: " + account.displayLabel());
+                } catch (Exception e) {
+                    extension.logger().error(LOG_PREFIX + "Failed to host server: " + e.getMessage());
+                    accounts.remove(account);
+                    source.sendMessage(LOG_PREFIX + "Failed to host server: " + e.getMessage());
+                }
             }).exceptionally(ex -> {
                 extension.logger().error(LOG_PREFIX + "Failed to add account: " + ex.getMessage());
                 accounts.remove(account);

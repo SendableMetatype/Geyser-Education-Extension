@@ -3,8 +3,8 @@ package org.geysermc.extension.edugeyser;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.checkerframework.checker.nullness.qual.Nullable;
-import org.geysermc.extension.edugeyser.joincode.JoinCodeNetherNetServer;
 import org.geysermc.geyser.api.command.CommandSource;
+import org.geysermc.geyser.api.network.NethernetManager;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -24,20 +24,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Pattern;
 
 /**
  * Manages Education Edition join codes (multi-account).
  *
- * Architecture: one shared Nethernet server with a stable nethernet ID, plus
- * one Discovery registration per education tenant. Nethernet signaling and
- * Discovery are independent systems. Discovery maps join codes to nethernet
- * IDs, the Nethernet signaling server just routes WebRTC connections. So we
- * run ONE signaling connection and point all tenant join codes at it.
- *
- * The nethernet ID is user-facing: clients can enter it directly to join
- * cross-tenant, bypassing join codes entirely. It's persisted so it survives
- * restarts.
+ * Architecture: Geyser owns the Nethernet server and connection ID. This
+ * manager only handles Discovery API registration (join codes) and OAuth
+ * device code flows. Each education tenant gets its own Discovery
+ * registration pointing at Geyser's shared connection ID.
  */
 public class JoinCodeManager {
 
@@ -50,23 +44,14 @@ public class JoinCodeManager {
     private static final int HTTP_TIMEOUT = 15000;
     private static final long HEARTBEAT_INTERVAL_SECONDS = 100;
     private static final long CODE_REMINDER_INTERVAL_SECONDS = 180;
-    private static final long SIGNALING_RECONNECT_INTERVAL_SECONDS = 120;
-    private static final Pattern VALID_NETHERNET_ID = Pattern.compile("^[0-9]{5,19}$");
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
     private final Object fileLock = new Object();
-    private final Object serverLock = new Object();
     private final List<JoinCodeAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<JoinCodeAccount, List<ScheduledFuture<?>>> accountTasks = new ConcurrentHashMap<>();
     private volatile @Nullable ScheduledFuture<?> codeReminderTask;
-    private volatile @Nullable ScheduledFuture<?> signalingReconnectTask;
     private volatile boolean shutdownRequested;
-
-    // Shared Nethernet server - one signaling WebSocket, all accounts' Discovery
-    // registrations point to this same nethernet ID.
-    private volatile @Nullable JoinCodeNetherNetServer netherNetServer;
-    private volatile @Nullable String netherNetId;
 
     // Global config shared by all accounts
     private String worldName = "Education Server";
@@ -92,17 +77,13 @@ public class JoinCodeManager {
         }
         loadAllAccounts();
 
-        // Start the Nethernet server unconditionally. It only needs a
-        // connection ID (from config) and an anonymous PlayFab MCToken.
-        // Education accounts are only required for Discovery (join codes),
-        // not for accepting connections via the connection ID directly.
-        if (!ensureNetherNetServer()) {
+        // Start the Nethernet server via Geyser's API
+        if (!ensureNethernet()) {
             extension.logger().error(LOG_PREFIX + "Nethernet server failed to start. " +
                     "Connection ID and join codes will not work.");
         }
 
-        // Restore existing accounts. Each account re-registers with Discovery
-        // to activate its join code. The Nethernet server is already running.
+        // Restore existing accounts
         for (int i = 0; i < accounts.size(); i++) {
             final int idx = i;
             JoinCodeAccount account = accounts.get(i);
@@ -110,13 +91,11 @@ public class JoinCodeManager {
         }
 
         scheduleCodeReminder();
-        scheduleSignalingReconnect();
     }
 
     public void shutdown() {
         shutdownRequested = true;
         if (codeReminderTask != null) codeReminderTask.cancel(false);
-        if (signalingReconnectTask != null) signalingReconnectTask.cancel(false);
         for (List<ScheduledFuture<?>> tasks : accountTasks.values()) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
@@ -132,12 +111,7 @@ public class JoinCodeManager {
             }
         }
 
-        synchronized (serverLock) {
-            if (netherNetServer != null) {
-                netherNetServer.shutdown();
-                netherNetServer = null;
-            }
-        }
+        // Nethernet server lifecycle is owned by Geyser - we don't shut it down
 
         saveAllAccounts();
         scheduler.shutdown();
@@ -198,16 +172,14 @@ public class JoinCodeManager {
     }
 
     private void completeAuthFlow(JoinCodeAccount account, int index) throws Exception {
-        // Ensure the shared Nethernet server is up before registering with Discovery.
-        // If another account's flow is currently starting it, we wait on serverLock.
-        if (!ensureNetherNetServer()) {
-            throw new IOException("Shared Nethernet server not available");
+        if (!ensureNethernet()) {
+            throw new IOException("Nethernet server not available");
         }
 
-        // Register with Discovery. Points this account's join code at the shared nethernetId.
+        String connectionId = getConnectionId();
         account.discoveryClient = new DiscoveryClient(extension.logger(), account.accessToken);
 
-        String code = account.discoveryClient.host(netherNetId, worldName, hostName, maxPlayers);
+        String code = account.discoveryClient.host(connectionId, worldName, hostName, maxPlayers);
         if (code == null) {
             throw new IOException("Failed to register with Discovery API");
         }
@@ -274,13 +246,11 @@ public class JoinCodeManager {
         }
         JoinCodeAccount account = accounts.get(index);
 
-        // Cancel scheduled tasks
         List<ScheduledFuture<?>> tasks = accountTasks.remove(account);
         if (tasks != null) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
 
-        // Dehost from Discovery (the shared Nethernet server keeps running for other accounts)
         if (account.discoveryClient != null && account.passcode != null) {
             try {
                 account.discoveryClient.dehost();
@@ -298,96 +268,24 @@ public class JoinCodeManager {
                 (" " + account.displayLabel()));
     }
 
-    // ---- Shared Nethernet server ----
+    // ---- Nethernet (via Geyser API) ----
 
-    /**
-     * Ensures the shared Nethernet server is running. Idempotent and thread-safe.
-     * The nethernet ID was picked at config creation time and is persistent.
-     */
-    private boolean ensureNetherNetServer() {
-        synchronized (serverLock) {
-            if (netherNetServer != null && netherNetServer.isRunning()) {
-                return true;
-            }
-
-            if (netherNetId == null || !VALID_NETHERNET_ID.matcher(netherNetId).matches()) {
-                extension.logger().error(LOG_PREFIX + "connection-id in joincode_config.yml is invalid: " +
-                        netherNetId + " (must be 5 to 19 decimal digits). " +
-                        "Fix the connection-id value in joincode_config.yml and restart.");
-                return false;
-            }
-
-            try {
-                PlayFabTokenManager playFab = new PlayFabTokenManager(extension.logger());
-                String mcToken = playFab.authenticate();
-                if (mcToken == null) {
-                    extension.logger().error(LOG_PREFIX + "Failed to obtain MCToken from PlayFab");
-                    return false;
-                }
-
-                String bindAddress = extension.geyserApi().bedrockListener().address();
-                String geyserHost = (bindAddress == null || bindAddress.isEmpty()
-                        || "0.0.0.0".equals(bindAddress) || "::".equals(bindAddress))
-                        ? "127.0.0.1" : bindAddress;
-                int geyserPort = extension.geyserApi().bedrockListener().port();
-                netherNetServer = new JoinCodeNetherNetServer(
-                        extension.logger(), geyserHost, geyserPort);
-
-                if (!netherNetServer.start(mcToken, netherNetId)) {
-                    netherNetServer = null;
-                    extension.logger().error(LOG_PREFIX + "Failed to start Nethernet server");
-                    return false;
-                }
-                extension.logger().info(LOG_PREFIX + "Connection ID: " + netherNetId +
-                        " (share this directly to let clients join cross-tenant)");
-                return true;
-            } catch (Exception e) {
-                extension.logger().error(LOG_PREFIX + "ensureNetherNetServer failed: " + e.getMessage());
-                return false;
-            }
+    private boolean ensureNethernet() {
+        NethernetManager manager = extension.geyserApi().nethernetManager();
+        if (manager == null) {
+            extension.logger().error(LOG_PREFIX + "Nethernet transport is not available. " +
+                    "Check that WebRTC native libraries are present and the connection ID file is valid.");
+            return false;
         }
+        if (manager.isRunning()) {
+            return true;
+        }
+        return manager.start();
     }
 
-    /**
-     * Rebuilds the shared Nethernet signaling with a fresh MCToken, preserving
-     * the same nethernetID so all Discovery registrations remain valid.
-     */
-    private boolean rebuildSharedSignaling(String reason) {
-        synchronized (serverLock) {
-            if (netherNetServer == null) {
-                return ensureNetherNetServer();
-            }
-            try {
-                PlayFabTokenManager playFab = new PlayFabTokenManager(extension.logger());
-                String mcToken = playFab.authenticate();
-                if (mcToken == null) {
-                    extension.logger().warning(LOG_PREFIX + "Rebuild (" + reason + "): failed to get MCToken");
-                    return false;
-                }
-                if (netherNetServer.restartSignaling(mcToken)) {
-                    extension.logger().info(LOG_PREFIX + "Shared signaling rebuilt (" + reason + ")");
-                    return true;
-                } else {
-                    extension.logger().warning(LOG_PREFIX + "Shared signaling rebuild failed (" + reason + ")");
-                    return false;
-                }
-            } catch (Exception e) {
-                extension.logger().warning(LOG_PREFIX + "Shared signaling rebuild error (" + reason + "): " + e.getMessage());
-                return false;
-            }
-        }
-    }
-
-    /**
-     * Generate a random nethernet ID. The ID is user-facing (clients can enter
-     * it directly to join cross-tenant) so we aim for something tractable.
-     * Real education clients generate 20-digit IDs, but variable lengths work.
-     * we use exactly 10 digits for consistency.
-     */
-    private static String generateNetherNetId() {
-        // [1_000_000_000, 10_000_000_000) - always 10 digits
-        long value = java.util.concurrent.ThreadLocalRandom.current().nextLong(1_000_000_000L, 10_000_000_000L);
-        return String.valueOf(value);
+    private @Nullable String getConnectionId() {
+        NethernetManager manager = extension.geyserApi().nethernetManager();
+        return manager != null ? manager.getConnectionId() : null;
     }
 
     // ---- Heartbeat (per account) ----
@@ -406,26 +304,6 @@ public class JoinCodeManager {
         accountTasks.computeIfAbsent(account, k -> new CopyOnWriteArrayList<>()).add(heartbeatTask);
     }
 
-    /**
-     * Periodically checks the shared Nethernet signaling WebSocket and rebuilds
-     * it only if dead, preserving the shared nethernetID so all Discovery
-     * registrations stay valid. Existing WebRTC peer connections are unaffected.
-     */
-    private void scheduleSignalingReconnect() {
-        signalingReconnectTask = scheduler.scheduleAtFixedRate(() -> {
-            if (shutdownRequested) return;
-            JoinCodeNetherNetServer server = netherNetServer;
-            if (server == null) {
-                ensureNetherNetServer();
-                return;
-            }
-            if (server.isSignalingAlive()) return;
-
-            extension.logger().info(LOG_PREFIX + "Shared signaling dead, rebuilding...");
-            rebuildSharedSignaling("reconnect");
-        }, SIGNALING_RECONNECT_INTERVAL_SECONDS, SIGNALING_RECONNECT_INTERVAL_SECONDS, TimeUnit.SECONDS);
-    }
-
     private void scheduleCodeReminder() {
         codeReminderTask = scheduler.scheduleAtFixedRate(() -> {
             if (shutdownRequested) return;
@@ -433,7 +311,7 @@ public class JoinCodeManager {
             for (JoinCodeAccount a : accounts) {
                 if (a.active && a.humanReadableCode != null && a.passcode != null) {
                     if (!any) {
-                        extension.logger().info(LOG_PREFIX + "Connection ID: " + netherNetId);
+                        extension.logger().info(LOG_PREFIX + "Connection ID: " + getConnectionId());
                         any = true;
                     }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() + ": " +
@@ -567,39 +445,33 @@ public class JoinCodeManager {
                     source.sendMessage(LOG_PREFIX + "Invalid number: " + args[1]);
                 }
             }
-            case "rebuild" -> forceRebuildAll(source);
+            case "rebuild" -> forceRebuild(source);
             default -> showStatus(source);
         }
     }
 
-    /**
-     * Temporary test command: force-rebuild the shared Nethernet signaling.
-     * Used to verify the rebuild path without waiting for a failed health check.
-     */
-    private void forceRebuildAll(CommandSource source) {
-        JoinCodeNetherNetServer server = netherNetServer;
-        if (server == null) {
-            source.sendMessage(LOG_PREFIX + "Shared Nethernet server not running.");
+    private void forceRebuild(CommandSource source) {
+        NethernetManager manager = extension.geyserApi().nethernetManager();
+        if (manager == null || !manager.isRunning()) {
+            source.sendMessage(LOG_PREFIX + "Nethernet server not running.");
             return;
         }
-        boolean alive = server.isSignalingAlive();
-        long silence = server.getSignalingSilenceMillis();
-        source.sendMessage(LOG_PREFIX + "Forcing rebuild of shared signaling...");
-        source.sendMessage(LOG_PREFIX + "  alive=" + alive + " | silence=" + silence + "ms | id=" + netherNetId);
+        source.sendMessage(LOG_PREFIX + "Forcing signaling rebuild...");
         scheduler.execute(() -> {
-            if (rebuildSharedSignaling("manual")) {
-                source.sendMessage(LOG_PREFIX + "\u2713 Rebuilt successfully");
+            if (manager.restartSignaling()) {
+                source.sendMessage(LOG_PREFIX + "Rebuilt successfully");
             } else {
-                source.sendMessage(LOG_PREFIX + "\u2717 Rebuild failed");
+                source.sendMessage(LOG_PREFIX + "Rebuild failed");
             }
         });
     }
 
     private void showStatus(CommandSource source) {
         source.sendMessage(LOG_PREFIX + "=== Join Codes ===");
-        JoinCodeNetherNetServer server = netherNetServer;
-        source.sendMessage("  Connection ID: " + netherNetId +
-                " (" + (server != null && server.isSignalingAlive() ? "alive" : "dead") + ")");
+        NethernetManager manager = extension.geyserApi().nethernetManager();
+        String connectionId = manager != null ? manager.getConnectionId() : "unavailable";
+        boolean alive = manager != null && manager.isSignalingAlive();
+        source.sendMessage("  Connection ID: " + connectionId + " (" + (alive ? "alive" : "dead") + ")");
         if (accounts.isEmpty()) {
             source.sendMessage("  No join codes registered. Use '/edu joincode add' to add one.");
             return;
@@ -621,10 +493,6 @@ public class JoinCodeManager {
     private boolean loadConfig() {
         Path configPath = extension.dataFolder().resolve(CONFIG_FILE);
         if (!Files.exists(configPath)) {
-            // First-ever start: generate the nethernet ID now and write it
-            // directly into the default config. Never touched again unless
-            // the user manually edits the file.
-            netherNetId = generateNetherNetId();
             try {
                 Files.writeString(configPath,
                         "# EduGeyser Join Code Configuration\n\n" +
@@ -632,16 +500,6 @@ public class JoinCodeManager {
                         "world-name: \"Education Server\"\n\n" +
                         "# Host name shown to joining clients.\n" +
                         "host-name: \"EduGeyser\"\n\n" +
-                        "# Connection ID. All join codes across all tenants point to this.\n" +
-                        "# Clients can also enter this ID directly in Education Edition's\n" +
-                        "# connection dialog to join cross-tenant, bypassing join codes.\n" +
-                        "#\n" +
-                        "# Recommended: keep this at 10 digits (the generated default).\n" +
-                        "# Do NOT pick predictable numbers like 123456789 or 1111111111.\n" +
-                        "# Someone else running another server could accidentally use the same\n" +
-                        "# ID, causing clients to be routed to the wrong server worldwide.\n" +
-                        "# Valid range: 5 to 19 digits.\n" +
-                        "connection-id: \"" + netherNetId + "\"\n\n" +
                         "# Maximum players shown.\n" +
                         "max-players: 40\n");
             } catch (IOException e) {
@@ -656,11 +514,6 @@ public class JoinCodeManager {
             var node = loader.load();
             worldName = node.node("world-name").getString("Education Server");
             hostName = node.node("host-name").getString("EduGeyser");
-            // Prefer new key; fall back to old key for existing installs
-            netherNetId = node.node("connection-id").getString();
-            if (netherNetId == null) {
-                netherNetId = node.node("nethernet-id").getString();
-            }
             maxPlayers = node.node("max-players").getInt(40);
             return true;
         } catch (Exception e) {

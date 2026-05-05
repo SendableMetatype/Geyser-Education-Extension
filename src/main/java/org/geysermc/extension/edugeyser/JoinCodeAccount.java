@@ -10,10 +10,8 @@ import java.util.Base64;
 /**
  * Holds the session state for a single join code registration.
  * Each account corresponds to one education tenant. Join codes are tenant-scoped.
- *
- * The Nethernet server is shared across all accounts (owned by JoinCodeManager).
- * All accounts' Discovery registrations point to the same shared nethernet ID,
- * since Nethernet signaling and Discovery are completely independent systems.
+ * All accounts' Discovery registrations point to the same connection ID
+ * owned by Geyser's Nethernet server.
  */
 public class JoinCodeAccount {
     // Auth state (from device code OAuth flow)
