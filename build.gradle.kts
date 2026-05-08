@@ -3,11 +3,11 @@ plugins {
 }
 
 group = "org.geysermc.extension"
-version = "3.0.0"
+version = "3.1.0"
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 repositories {
@@ -19,8 +19,8 @@ repositories {
 }
 
 dependencies {
-    compileOnly("com.github.SendableMetatype.EduGeyser:api:master-SNAPSHOT")
-    compileOnly("com.github.SendableMetatype.EduGeyser:core:master-SNAPSHOT")
+    compileOnly("com.github.SendableMetatype.EduGeyser:api:49511769")
+    compileOnly("com.github.SendableMetatype.EduGeyser:core:49511769")
     implementation("org.spongepowered:configurate-yaml:4.1.2")
 }
 
