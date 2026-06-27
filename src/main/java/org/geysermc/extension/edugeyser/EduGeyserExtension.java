@@ -3,23 +3,41 @@ package org.geysermc.extension.edugeyser;
 import org.geysermc.event.subscribe.Subscribe;
 import org.geysermc.geyser.api.command.Command;
 import org.geysermc.geyser.api.command.CommandSource;
+import org.geysermc.geyser.api.event.bedrock.SessionLoginEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserDefineCommandsEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserPostInitializeEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserShutdownEvent;
 import org.geysermc.geyser.api.extension.Extension;
+import org.geysermc.geyser.session.GeyserSession;
 
 public class EduGeyserExtension implements Extension {
 
     private MessServerListManager serverListManager;
     private JoinCodeManager joinCodeManager;
+    private TenantWhitelist tenantWhitelist;
 
     @Subscribe
     public void onPostInitialize(GeyserPostInitializeEvent event) {
+        tenantWhitelist = new TenantWhitelist(this);
+        tenantWhitelist.load();
+
         serverListManager = new MessServerListManager(this);
         serverListManager.initialize();
 
         joinCodeManager = new JoinCodeManager(this);
         joinCodeManager.initialize();
+    }
+
+    @Subscribe
+    public void onSessionLogin(SessionLoginEvent event) {
+        if (tenantWhitelist == null || !tenantWhitelist.isEnabled()) return;
+        if (!(event.connection() instanceof GeyserSession session)) return;
+        if (!session.isEducationClient()) return;
+
+        String tenantId = session.getEducationTenantId();
+        if (!tenantWhitelist.isAllowed(tenantId)) {
+            event.setCancelled(true, "Your organization is not allowed on this server.");
+        }
     }
 
     @Subscribe
