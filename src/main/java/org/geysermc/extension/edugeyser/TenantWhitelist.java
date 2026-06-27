@@ -24,35 +24,7 @@ public class TenantWhitelist {
     public void load() {
         Path path = extension.dataFolder().resolve(FILE_NAME);
         if (!Files.exists(path)) {
-            try {
-                Files.createDirectories(extension.dataFolder());
-                Files.writeString(path,
-                        "# tenant_whitelist.yml\n" +
-                        "#\n" +
-                        "# ADVANCED FEATURE. Restricts which organizations (Microsoft Entra\n" +
-                        "# tenants) are allowed to join. Configuring this incorrectly can stop\n" +
-                        "# legitimate players from joining, so leave the tenant list empty\n" +
-                        "# unless you specifically need it.\n" +
-                        "#\n" +
-                        "# enabled: master on/off switch. Set to false to turn the whitelist\n" +
-                        "#   off without removing your tenant list below, so you can re-enable\n" +
-                        "#   it later.\n" +
-                        "# tenants: the allowed tenant IDs. While enabled is true, an empty\n" +
-                        "#   list allows everyone and a non-empty list allows only those tenants.\n" +
-                        "#\n" +
-                        "# How to find your tenant ID:\n" +
-                        "#   https://learn.microsoft.com/en-us/sharepoint/find-your-office-365-tenant-id\n" +
-                        "#   https://tenantidlookup.com/\n" +
-                        "#\n" +
-                        "# Example: \"03b5e7a1-cb09-4417-9e1a-c686b440b2c5\"\n" +
-                        "enabled: true\n" +
-                        "tenants:\n" +
-                        "  - \"\"\n" +
-                        "  - \"\"\n" +
-                        "  - \"\"\n");
-            } catch (IOException e) {
-                extension.logger().error(LOG_PREFIX + "Failed to create whitelist file: " + e.getMessage());
-            }
+            writeTemplate(path);
             return;
         }
 
@@ -60,6 +32,17 @@ public class TenantWhitelist {
             var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
                     .path(path).build();
             var root = loader.load();
+
+            // If the on/off switch is missing (e.g. a config from before this option
+            // existed), regenerate the whole file rather than work from a partial config.
+            if (root.node("enabled").virtual()) {
+                extension.logger().warning(LOG_PREFIX + "Config is missing the 'enabled' option; regenerating " + FILE_NAME + " from defaults.");
+                writeTemplate(path);
+                enabled = true;
+                allowedTenants.clear();
+                return;
+            }
+
             enabled = root.node("enabled").getBoolean(true);
             var tenantsList = root.node("tenants").getList(String.class);
             allowedTenants.clear();
@@ -80,6 +63,38 @@ public class TenantWhitelist {
             }
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load whitelist: " + e.getMessage());
+        }
+    }
+
+    private void writeTemplate(Path path) {
+        try {
+            Files.createDirectories(extension.dataFolder());
+            Files.writeString(path,
+                    "# tenant_whitelist.yml\n" +
+                    "#\n" +
+                    "# ADVANCED FEATURE. Restricts which organizations (Microsoft Entra\n" +
+                    "# tenants) are allowed to join. Configuring this incorrectly can stop\n" +
+                    "# legitimate players from joining, so leave the tenant list empty\n" +
+                    "# unless you specifically need it.\n" +
+                    "#\n" +
+                    "# enabled: master on/off switch. Set to false to turn the whitelist\n" +
+                    "#   off without removing your tenant list below, so you can re-enable\n" +
+                    "#   it later.\n" +
+                    "# tenants: the allowed tenant IDs. While enabled is true, an empty\n" +
+                    "#   list allows everyone and a non-empty list allows only those tenants.\n" +
+                    "#\n" +
+                    "# How to find your tenant ID:\n" +
+                    "#   https://learn.microsoft.com/en-us/sharepoint/find-your-office-365-tenant-id\n" +
+                    "#   https://tenantidlookup.com/\n" +
+                    "#\n" +
+                    "# Example: \"03b5e7a1-cb09-4417-9e1a-c686b440b2c5\"\n" +
+                    "enabled: true\n" +
+                    "tenants:\n" +
+                    "  - \"\"\n" +
+                    "  - \"\"\n" +
+                    "  - \"\"\n");
+        } catch (IOException e) {
+            extension.logger().error(LOG_PREFIX + "Failed to write whitelist file: " + e.getMessage());
         }
     }
 
