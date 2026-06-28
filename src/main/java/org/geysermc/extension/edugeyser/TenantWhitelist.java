@@ -11,7 +11,7 @@ import java.util.Set;
 public class TenantWhitelist {
 
     private static final String FILE_NAME = "tenant_whitelist.yml";
-    private static final String LOG_PREFIX = "[edu] [TenantWhitelist] ";
+    private static final String LOG_PREFIX = "[TenantWhitelist] ";
 
     private final Extension extension;
     private final Set<String> allowedTenants = new HashSet<>();
@@ -58,9 +58,8 @@ public class TenantWhitelist {
                         + allowedTenants.size() + " tenant(s) kept in config.");
             } else if (!allowedTenants.isEmpty()) {
                 extension.logger().info(LOG_PREFIX + "Tenant whitelist active with " + allowedTenants.size() + " tenant(s).");
-            } else {
-                extension.logger().info(LOG_PREFIX + "Tenant whitelist is empty. All tenants are allowed.");
             }
+            // Enabled but empty is the default, unused state; stay silent to avoid log spam.
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load whitelist: " + e.getMessage());
         }
