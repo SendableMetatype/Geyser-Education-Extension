@@ -100,18 +100,10 @@ public class JoinCodeManager {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
 
-        for (JoinCodeAccount account : accounts) {
-            if (account.discoveryClient != null && account.passcode != null) {
-                try {
-                    account.discoveryClient.dehost();
-                } catch (Exception e) {
-                    extension.logger().warning(LOG_PREFIX + "Dehost failed for tenant " +
-                            account.displayLabel() + ": " + e.getMessage());
-                }
-            }
-        }
-
-        // Nethernet server lifecycle is owned by Geyser - we don't shut it down
+        // We deliberately do not dehost on shutdown. Leaving the registration in
+        // place lets the next startup resume the same join code, since the server
+        // keeps it alive far longer than any restart. The Nethernet server lifecycle
+        // is owned by Geyser.
 
         saveAllAccounts();
         scheduler.shutdown();
@@ -179,6 +171,29 @@ public class JoinCodeManager {
         String connectionId = getConnectionId();
         account.discoveryClient = new DiscoveryClient(extension.logger(), account.accessToken);
 
+        // Try to resume the existing registration so the join code survives a restart.
+        // Only safe when we have a saved code and the connection id it was hosted with
+        // still matches, since the registration points at that id on the server.
+        boolean canResume = account.serverToken != null && account.passcode != null
+                && account.connectionId != null && account.connectionId.equals(connectionId);
+        if (canResume) {
+            account.discoveryClient.setServerToken(account.serverToken);
+            account.discoveryClient.setPasscode(account.passcode);
+            if (account.discoveryClient.heartbeat()) {
+                account.humanReadableCode = DiscoveryClient.parseJoinCode(account.passcode);
+                account.extractTenantId();
+                account.active = true;
+                scheduleHeartbeat(account);
+                saveAllAccounts();
+                extension.logger().debug(LOG_PREFIX + "Resumed existing join code for tenant " +
+                        account.displayLabel());
+                return;
+            }
+            // The saved registration has expired. Fall through and host a new code.
+            extension.logger().debug(LOG_PREFIX + "Saved join code no longer active; hosting a new one for tenant " +
+                    account.displayLabel());
+        }
+
         String code = account.discoveryClient.host(connectionId, worldName, hostName, maxPlayers);
         if (code == null) {
             throw new IOException("Failed to register with Discovery API");
@@ -187,6 +202,7 @@ public class JoinCodeManager {
         account.humanReadableCode = code;
         account.passcode = account.discoveryClient.getPasscode();
         account.serverToken = account.discoveryClient.getServerToken();
+        account.connectionId = connectionId;
         account.extractTenantId();
         account.active = true;
 
@@ -251,13 +267,8 @@ public class JoinCodeManager {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
 
-        if (account.discoveryClient != null && account.passcode != null) {
-            try {
-                account.discoveryClient.dehost();
-            } catch (Exception e) {
-                extension.logger().warning(LOG_PREFIX + "Dehost failed: " + e.getMessage());
-            }
-        }
+        // No dehost. With its heartbeat task cancelled above, the code stops being
+        // beaten and ages out on its own within the server's window.
 
         String oldCode = account.humanReadableCode;
         accounts.remove(account);
@@ -539,6 +550,7 @@ public class JoinCodeManager {
                         a.accessTokenExpires = node.node("access-token-expires").getLong(0);
                         a.passcode = node.node("passcode").getString();
                         a.serverToken = node.node("server-token").getString();
+                        a.connectionId = node.node("connection-id").getString();
                         a.extractTenantId();
                         a.extractTokenClaims();
                         if (a.passcode != null) {
@@ -567,6 +579,7 @@ public class JoinCodeManager {
                     sb.append("    access-token-expires: ").append(a.accessTokenExpires).append("\n");
                     sb.append("    passcode: ").append(yamlStr(a.passcode)).append("\n");
                     sb.append("    server-token: ").append(yamlStr(a.serverToken)).append("\n");
+                    sb.append("    connection-id: ").append(yamlStr(a.connectionId)).append("\n");
                 }
                 Files.writeString(path, sb.toString());
             } catch (Exception e) {
@@ -581,6 +594,7 @@ public class JoinCodeManager {
         account.accessTokenExpires = 0;
         account.passcode = null;
         account.serverToken = null;
+        account.connectionId = null;
         account.humanReadableCode = null;
         account.active = false;
         saveAllAccounts();

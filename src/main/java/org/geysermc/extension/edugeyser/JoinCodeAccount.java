@@ -22,6 +22,7 @@ public class JoinCodeAccount {
     // Discovery state
     volatile @Nullable String passcode;
     volatile @Nullable String serverToken;
+    volatile @Nullable String connectionId;
 
     // Runtime (not persisted)
     volatile @Nullable String tenantId;
