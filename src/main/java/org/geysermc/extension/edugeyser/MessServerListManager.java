@@ -51,8 +51,10 @@ public class MessServerListManager {
     private static final long TOKEN_EXPIRY_BUFFER_SECONDS = 60;
     private static final int MESS_HEALTH_OPTIMAL = 2;
     // The server list tile only changes visually with the player count, so updates are
-    // sent on change; the keepalive stays well inside MESS's 1 hour liveness window.
-    private static final long UPDATE_KEEPALIVE_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    // sent on change. MESS quietly decays the DISPLAYED health of servers whose last
+    // update is stale (Mid after a few minutes, Poor near five, offline at 1 hour), so
+    // the keepalive must stay under the first decay step; 2 minutes holds full health.
+    private static final long UPDATE_KEEPALIVE_MILLIS = TimeUnit.MINUTES.toMillis(2);
     private static final String[] PUBLIC_IP_SERVICES = {
             "https://checkip.amazonaws.com",
             "https://api.ipify.org",

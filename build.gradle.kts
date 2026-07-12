@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "org.geysermc.extension"
-version = "3.4.0"
+version = "3.4.1"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
