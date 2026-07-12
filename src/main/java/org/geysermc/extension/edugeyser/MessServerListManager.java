@@ -241,17 +241,37 @@ public class MessServerListManager {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
 
-        if (account.serverToken != null) {
-            try {
-                dehostServer(account);
-            } catch (Exception e) {
-                extension.logger().warning(LOG_PREFIX + "Could not dehost: " + e.getMessage());
-            }
-        }
         accounts.remove(account);
         saveAllAccounts();
         source.sendMessage(LOG_PREFIX + "Removed account #" + number +
                 (" (" + account.displayLabel() + ")"));
+
+        // The remote cleanup can block on network timeouts, so it runs off the command thread.
+        scheduler.execute(() -> {
+            if (account.serverToken != null) {
+                try {
+                    dehostServer(account);
+                } catch (Exception e) {
+                    extension.logger().warning(LOG_PREFIX + "Could not dehost: " + e.getMessage());
+                }
+            }
+
+            // The serverId only exists in our session file, so removing the account would
+            // orphan the registration as a dead tile in the tenant's server list forever.
+            // Best effort: delete it; the account is already removed locally regardless.
+            if (account.serverId != null && !account.serverId.isEmpty()) {
+                try {
+                    ensureValidAccessToken(account);
+                    JsonObject body = new JsonObject();
+                    body.addProperty("ServerId", account.serverId);
+                    postJsonWithAuth(MESS_BASE + "/tooling/delete_server_registration", account.accessToken, body.toString());
+                    extension.logger().info(LOG_PREFIX + "Deleted server registration " + account.serverId);
+                } catch (Exception e) {
+                    extension.logger().warning(LOG_PREFIX + "Could not delete server registration "
+                            + account.serverId + ": " + e.getMessage());
+                }
+            }
+        });
     }
 
     // ---- Device Code OAuth ----
