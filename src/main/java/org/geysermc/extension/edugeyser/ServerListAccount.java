@@ -31,6 +31,11 @@ public class ServerListAccount {
     volatile @Nullable String upn;
     volatile boolean active = false;
 
+    // Update cadence: the player count last successfully reported to MESS and when.
+    // -1 forces a send on the first tick after hosting.
+    volatile int lastSentPlayerCount = -1;
+    volatile long lastSuccessfulUpdateMillis;
+
     /**
      * Extract the tenant ID from the server token (first pipe segment).
      */

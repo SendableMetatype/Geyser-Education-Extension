@@ -50,6 +50,9 @@ public class MessServerListManager {
     private static final int HTTP_TIMEOUT = 15000;
     private static final long TOKEN_EXPIRY_BUFFER_SECONDS = 60;
     private static final int MESS_HEALTH_OPTIMAL = 2;
+    // The server list tile only changes visually with the player count, so updates are
+    // sent on change; the keepalive stays well inside MESS's 1 hour liveness window.
+    private static final long UPDATE_KEEPALIVE_MILLIS = TimeUnit.MINUTES.toMillis(5);
     private static final String[] PUBLIC_IP_SERVICES = {
             "https://checkip.amazonaws.com",
             "https://api.ipify.org",
@@ -511,6 +514,8 @@ public class MessServerListManager {
         JsonObject body = new JsonObject();
         body.add("connectionInfo", connectionInfo);
         postJsonWithAuth(MESS_BASE + "/server/host", account.serverToken, body.toString());
+        // Hosting resets MESS's view of the server, so force a fresh update on the next tick.
+        account.lastSentPlayerCount = -1;
     }
 
     private void dehostServer(ServerListAccount account) throws IOException {
@@ -540,10 +545,17 @@ public class MessServerListManager {
     private void sendServerUpdate(ServerListAccount account) {
         try {
             int playerCount = getPlayerCount();
+            long now = System.currentTimeMillis();
+            if (playerCount == account.lastSentPlayerCount
+                    && now - account.lastSuccessfulUpdateMillis < UPDATE_KEEPALIVE_MILLIS) {
+                return;
+            }
             String json = "{\"playerCount\":" + playerCount
                     + ",\"maxPlayers\":" + globalMaxPlayers
                     + ",\"health\":" + MESS_HEALTH_OPTIMAL + "}";
             postJsonWithAuth(MESS_BASE + "/server/update", account.serverToken, json);
+            account.lastSentPlayerCount = playerCount;
+            account.lastSuccessfulUpdateMillis = now;
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Server update failed: " + e.getMessage());
         }
