@@ -179,9 +179,10 @@ public class JoinCodeManager {
         if (canResume) {
             account.discoveryClient.setServerToken(account.serverToken);
             account.discoveryClient.setPasscode(account.passcode);
-            if (account.discoveryClient.heartbeat()) {
+            if (account.discoveryClient.heartbeat() == DiscoveryClient.HeartbeatResult.OK) {
                 account.humanReadableCode = DiscoveryClient.parseJoinCode(account.passcode);
                 account.extractTenantId();
+                account.rehosting = false;
                 account.active = true;
                 scheduleHeartbeat(account);
                 saveAllAccounts();
@@ -204,6 +205,7 @@ public class JoinCodeManager {
         account.serverToken = account.discoveryClient.getServerToken();
         account.connectionId = connectionId;
         account.extractTenantId();
+        account.rehosting = false;
         account.active = true;
 
         scheduleHeartbeat(account);
@@ -304,15 +306,57 @@ public class JoinCodeManager {
     private void scheduleHeartbeat(JoinCodeAccount account) {
         ScheduledFuture<?> heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
             if (shutdownRequested || !account.active) return;
-            if (account.discoveryClient != null) {
-                if (!account.discoveryClient.heartbeat()) {
-                    extension.logger().warning(LOG_PREFIX + "Heartbeat failed for tenant " +
-                            account.displayLabel());
-                }
+            DiscoveryClient client = account.discoveryClient;
+            if (client == null) return;
+            switch (client.heartbeat()) {
+                case OK -> account.rehosting = false;
+                case TRANSIENT -> extension.logger().warning(LOG_PREFIX + "Heartbeat failed for tenant " +
+                        account.displayLabel());
+                case REGISTRATION_DEAD -> rehost(account);
             }
         }, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         accountTasks.computeIfAbsent(account, k -> new CopyOnWriteArrayList<>()).add(heartbeatTask);
+    }
+
+    /**
+     * Replace a registration that can no longer be heartbeat. A dead code cannot
+     * be revived, so the only recovery is hosting a new one. The account's saved
+     * Entra access token is hours or days old by now (they live about an hour),
+     * so it must be refreshed before /host, and the DiscoveryClient rebuilt since
+     * it binds the access token at construction. Runs inside the heartbeat task;
+     * on failure the next heartbeat hits the dead registration again and retries.
+     */
+    private void rehost(JoinCodeAccount account) {
+        account.rehosting = true;
+        extension.logger().warning(LOG_PREFIX + "Join code " +
+                (account.humanReadableCode != null ? account.humanReadableCode + " " : "") +
+                "for tenant " + account.displayLabel() + " is no longer valid, trying to obtain a new one...");
+        try {
+            refreshAccessToken(account);
+            String connectionId = getConnectionId();
+            if (connectionId == null) {
+                throw new IOException("Nethernet connection ID unavailable");
+            }
+            DiscoveryClient client = new DiscoveryClient(extension.logger(), account.accessToken);
+            String code = client.host(connectionId, worldName, hostName, maxPlayers);
+            if (code == null) {
+                throw new IOException("Failed to register with Discovery API");
+            }
+            account.discoveryClient = client;
+            account.humanReadableCode = code;
+            account.passcode = client.getPasscode();
+            account.serverToken = client.getServerToken();
+            account.connectionId = connectionId;
+            account.extractTenantId();
+            account.rehosting = false;
+            saveAllAccounts();
+            extension.logger().info(LOG_PREFIX + "New join code for " + account.displayLabel() + ": " + code +
+                    (account.passcode != null ? " | " + DiscoveryClient.createShareLink(account.passcode) : ""));
+        } catch (Exception e) {
+            extension.logger().error(LOG_PREFIX + "Rehost failed for tenant " + account.displayLabel() +
+                    ": " + e.getMessage() + " (retrying on the next heartbeat)");
+        }
     }
 
     private void scheduleCodeReminder() {
@@ -320,7 +364,14 @@ public class JoinCodeManager {
             if (shutdownRequested) return;
             boolean any = false;
             for (JoinCodeAccount a : accounts) {
-                if (a.active && a.humanReadableCode != null && a.passcode != null) {
+                if (a.rehosting) {
+                    if (!any) {
+                        extension.logger().info(LOG_PREFIX + "Connection ID: " + getConnectionId());
+                        any = true;
+                    }
+                    extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() +
+                            ": trying to obtain a new join code...");
+                } else if (a.active && a.humanReadableCode != null && a.passcode != null) {
                     if (!any) {
                         extension.logger().info(LOG_PREFIX + "Connection ID: " + getConnectionId());
                         any = true;
@@ -490,6 +541,11 @@ public class JoinCodeManager {
         for (int i = 0; i < accounts.size(); i++) {
             JoinCodeAccount a = accounts.get(i);
             String tenant = a.displayLabel();
+            if (a.rehosting) {
+                source.sendMessage("  #" + (i + 1) + " | " + tenant +
+                        " | trying to obtain a new join code");
+                continue;
+            }
             String status = a.active ? "active" : "inactive";
             String code = a.humanReadableCode != null ? a.humanReadableCode : "none";
             source.sendMessage("  #" + (i + 1) + " | " + tenant + " | code: " + code + " | " + status);
@@ -596,6 +652,7 @@ public class JoinCodeManager {
         account.serverToken = null;
         account.connectionId = null;
         account.humanReadableCode = null;
+        account.rehosting = false;
         account.active = false;
         saveAllAccounts();
     }

@@ -30,6 +30,7 @@ public class JoinCodeAccount {
     volatile @Nullable String humanReadableCode;
     volatile @Nullable DiscoveryClient discoveryClient;
     volatile boolean active = false;
+    volatile boolean rehosting = false;
 
     /**
      * Extract the tenant ID from the Discovery server token (first pipe segment).

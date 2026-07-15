@@ -25,6 +25,30 @@ public class DiscoveryClient {
     private static final int BUILD_NUMBER = 12232001;
     private static final int HTTP_TIMEOUT = 15000;
 
+    /**
+     * Outcome of a heartbeat, classified so callers can tell a dead registration
+     * from a transient failure. A registration is dead when the API rejects our
+     * credentials (401/403, the serverToken expires 10 days after issue) or no
+     * longer knows the host (404). Auth is checked before host existence, so an
+     * expired token reports 401 forever and the 404 underneath is never visible.
+     * Anything else (timeouts, 5xx) is transient and worth retrying as is.
+     */
+    public enum HeartbeatResult {
+        OK,
+        REGISTRATION_DEAD,
+        TRANSIENT
+    }
+
+    /** IOException carrying the HTTP status code so callers can classify failures. */
+    public static class HttpStatusException extends IOException {
+        final int status;
+
+        HttpStatusException(int status, String message) {
+            super(message);
+            this.status = status;
+        }
+    }
+
     // Join code symbol names (index 0-17)
     private static final String[] CODE_SYMBOLS = {
         "Book", "Balloon", "Rail", "Alex", "Cookie", "Fish", "Agent", "Cake", "Pickaxe",
@@ -84,8 +108,8 @@ public class DiscoveryClient {
      * Send a heartbeat to keep the join code alive.
      * Should be called every 100 seconds.
      */
-    public boolean heartbeat() {
-        if (serverToken == null || passcode == null) return false;
+    public HeartbeatResult heartbeat() {
+        if (serverToken == null || passcode == null) return HeartbeatResult.TRANSIENT;
         try {
             JsonObject body = new JsonObject();
             body.addProperty("build", BUILD_NUMBER);
@@ -95,10 +119,16 @@ public class DiscoveryClient {
             body.addProperty("transportType", 2);
 
             postWithServerToken(DISCOVERY_BASE + "/heartbeat", body.toString());
-            return true;
+            return HeartbeatResult.OK;
+        } catch (HttpStatusException e) {
+            logger.error("[Discovery] Heartbeat failed: " + e.getMessage());
+            if (e.status == 401 || e.status == 403 || e.status == 404) {
+                return HeartbeatResult.REGISTRATION_DEAD;
+            }
+            return HeartbeatResult.TRANSIENT;
         } catch (IOException e) {
             logger.error("[Discovery] Heartbeat failed: " + e.getMessage());
-            return false;
+            return HeartbeatResult.TRANSIENT;
         }
     }
 
@@ -197,7 +227,7 @@ public class DiscoveryClient {
             int code = con.getResponseCode();
             if (code >= 400) {
                 String err = readStream(con.getErrorStream());
-                throw new IOException("HTTP " + code + ": " + err);
+                throw new HttpStatusException(code, "HTTP " + code + ": " + err);
             }
 
             try (InputStreamReader isr = new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8)) {
@@ -227,7 +257,7 @@ public class DiscoveryClient {
             int code = con.getResponseCode();
             if (code >= 400) {
                 String err = readStream(con.getErrorStream());
-                throw new IOException("HTTP " + code + ": " + err);
+                throw new HttpStatusException(code, "HTTP " + code + ": " + err);
             }
         } finally {
             con.disconnect();
