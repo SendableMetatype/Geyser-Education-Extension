@@ -1,29 +1,33 @@
 # Geyser Education Extension
 
-Required [EduGeyser](https://github.com/SendableMetatype/EduGeyser) extension that handles how Minecraft Education Edition students connect to your server:
+> [!IMPORTANT]
+> If you are an end user of EduGeyser and looking to set it up, this repo has nothing of value to you. Get EduGeyser from the [download page](https://edugeyser.org/download) instead, and follow the [setup guide](https://edugeyser.org/wiki/geyser/education/setup) on the website.
 
-1. **Connection ID** - A 10-digit number that students enter in Education Edition's connection dialog. Works across all tenants. Generated automatically on first start, no accounts needed.
-2. **Join Codes** - Tenant-scoped codes that students enter in Education Edition's "Join Code" screen, or click a share link. Requires an M365 Education account.
-3. **Server List** - Broadcasts your server to Education Edition's built-in server browser. Requires Global Admin access to an M365 Education tenant.
+This is the source code of the education extension that ships bundled inside [EduGeyser](https://edugeyser.org/). It installs itself automatically on startup; there is nothing to download and nothing to place in the extensions folder. It handles how Minecraft Education Edition students connect to a server:
 
-## Requirements
+1. **Connection ID**: a numeric ID that students enter in Education Edition's connection dialog. Works across all tenants, no accounts needed.
+2. **Join Codes**: codes that students enter on Education Edition's join code screen, or open through a share link. Each code is tied to one M365 Education tenant.
+3. **Server List**: broadcasts the server to Education Edition's own server browser. Requires Global Admin access to an M365 Education tenant.
+4. **Tenant Whitelist**: optionally restricts which organizations may join.
 
-- [EduGeyser](https://github.com/SendableMetatype/EduGeyser) (Geyser fork with education support)
-- Java 17+
+Full user documentation lives on the website: [edugeyser.org/wiki/geyser/education/connection-methods](https://edugeyser.org/wiki/geyser/education/connection-methods)
 
-## Setup
+## Connection ID
 
-1. Download the latest release JAR from [Releases](https://github.com/SendableMetatype/Geyser-Education-Extension/releases)
-2. Place it in Geyser's `extensions/` folder
-3. Start the server
+The connection ID is generated and owned by EduGeyser itself, not by this extension. It is stored in `nethernet/connection-id.yml` inside the Geyser folder, persists across restarts, and is printed to the console on every startup. There are two formats, one per client generation, each printed with a matching label:
 
-On first start, the extension generates a **Connection ID** and prints it to the console. Students connect by opening Education Edition, pressing **Play**, then **Join World**, then the small **...** button to the right of the confirm button. In this dialog they can enter the Connection ID to join.
+```
+[Nethernet] Listening on connection ID (1.21.133 and older): 123456789012345678
+[Nethernet] Connection ID (26.30 and newer): 1234567890123456785daffd38c5bbac52ba313d53d9354b58
+```
 
-That's it for basic setup. No accounts or configuration needed.
+The 26.30 format is the same ID followed by an account identifier that EduGeyser stores alongside it, so both formats are stable across restarts. Generated IDs are 18 digits; edited values may be 10 to 18 digits. Delete the file to generate a fresh one, which also resets the 26.30 format. Keep the ID random, predictable numbers invite collisions with other servers.
+
+Students connect by opening Education Edition, pressing **Play**, then **Join World**, then the small **...** button to the right of the confirm button. In this dialog they can enter the connection ID to join.
 
 ## Join Codes (Optional)
 
-Join codes let students connect by entering symbols in Education Edition's join screen, or by clicking a share link. Join codes are tenant-scoped: each code only works for students in the same tenant as the account that created it.
+Join codes let students connect by entering symbols on Education Edition's join screen, or by clicking a share link. Each code only works for students in the same tenant as the account that created it.
 
 ### Quick Start
 
@@ -31,24 +35,22 @@ Join codes let students connect by entering symbols in Education Edition's join 
 2. Sign in with any M365 Education account when prompted
 3. The join code, share link, and connection ID are printed to the console
 4. Share with students:
-    - **Join code link** - one-click join: `https://education.minecraft.net/joinworld/...`
-    - **Connection ID** - works across any tenant
+    * **Join code link** for joining with one click: `https://education.minecraft.net/joinworld/...`
+    * **Connection ID**, which works across any tenant
 
-The active connection ID and all join codes are printed to the console every 3 minutes as a reminder.
+While at least one join code is active, the connection IDs and all codes are printed to the console every 3 minutes as a reminder.
 
 ### Multiple Tenants
 
-Run `/edu joincode add` once per tenant. Each requires a separate education account sign-in. All tenants share the same connection ID - only the join codes are tenant-specific.
+Run `/edu joincode add` once per tenant. Each requires a separate education account sign in. All tenants share the same connection ID; only the join codes are per tenant.
 
 ### Configuration
 
-Edit `plugins/Geyser-*/extensions/edu/joincode_config.yml`:
+Edit `extensions/edu/joincode_config.yml` inside the Geyser folder:
 
 ```yaml
-world-name: "My School Server"
+world-name: "Education Server"
 host-name: "EduGeyser"
-connection-id: "1234567890"  # Auto-generated on first run. Do NOT change to a predictable
-                             # number - random 10-digit IDs avoid worldwide collisions.
 max-players: 40
 ```
 
@@ -56,24 +58,25 @@ max-players: 40
 
 | Command | Description |
 |---------|-------------|
-| `/edu joincode` | Show connection ID, active join codes, and share links |
+| `/edu joincode` | Show the connection IDs, active join codes, and share links |
 | `/edu joincode add` | Create a join code for a new tenant |
 | `/edu joincode remove <number>` | Remove a join code by its index |
+| `/edu joincode rebuild` | Force a rebuild of the signaling connection |
 
 ### Notes
 
-- Connection ID is **persistent** across restarts (stored in config)
-- Join codes and share links **change on every server restart**
-- Codes stay alive via heartbeat while the server is running
-- No Global Admin access required - any education account works
+* The connection ID is persistent across restarts (stored by EduGeyser in `nethernet/connection-id.yml`)
+* Join codes and share links change on every server restart
+* Codes stay alive via heartbeat while the server is running
+* No Global Admin access required, any education account works
 
 ## Server List (Optional)
 
-Broadcasts your server to Education Edition's built-in server browser. Requires Global Admin access to each M365 Education tenant.
+Broadcasts your server to Education Edition's own server browser. Requires Global Admin access to each M365 Education tenant.
 
 ### Quick Start
 
-1. Edit `plugins/Geyser-*/extensions/edu/serverlist_config.yml`:
+1. Edit `extensions/edu/serverlist_config.yml`:
 
 ```yaml
 server-name: "My School Server"
@@ -82,11 +85,11 @@ server-port: "19132"         # The external port students connect to.
 max-players: 40
 ```
 
-> **Always set `server-ip` and `server-port` explicitly.** Auto-detection is best-effort and will cause issues behind NAT, tunnels, reverse proxies, or when the external port differs from Geyser's bind port.
+> **Always set `server-ip` and `server-port` explicitly.** Automatic detection is best effort and will cause issues behind NAT, tunnels, and reverse proxies, or when the external port differs from Geyser's bind port.
 
 2. Restart the server
 3. Run `/edu serverlist add` from the console
-4. Two device code prompts appear - sign in with a Global Admin M365 Education account
+4. Two device code prompts appear, sign in with a Global Admin M365 Education account
 5. The server now appears in Education Edition's server list for that tenant
 
 ### Multiple Tenants
@@ -98,17 +101,36 @@ Run `/edu serverlist add` once per tenant. Each requires its own Global Admin ac
 | Command | Description |
 |---------|-------------|
 | `/edu serverlist` | Show all registered accounts with status |
-| `/edu serverlist add` | Start device code flow for a new tenant |
+| `/edu serverlist add` | Start the device code flow for a new tenant |
 | `/edu serverlist remove <number>` | Remove an account by its index |
+
+## Tenant Whitelist (Optional)
+
+Restricts which organizations (Microsoft Entra tenants) are allowed to join. Edit `extensions/edu/tenant_whitelist.yml`:
+
+```yaml
+enabled: true
+tenants:
+  - "03b5e7a1-cb09-4417-9e1a-c686b440b2c5"
+```
+
+* `enabled` is the master switch. Set it to `false` to turn the whitelist off without deleting your list.
+* While enabled, an empty list allows everyone and a filled list allows only the listed tenants.
+
+This is an advanced feature. A wrong tenant list stops legitimate students from joining, so leave the list empty unless you specifically need it.
 
 ## Files
 
+All paths are relative to the Geyser folder, which depends on your platform: `plugins/Geyser-Spigot/` on Paper and Spigot, `plugins/geyser/` on Velocity, `config/Geyser-Fabric/` on Fabric, or the working directory for standalone.
+
 | File | Purpose |
 |------|---------|
-| `joincode_config.yml` | World name, host name, **connection ID**, max players |
-| `sessions_joincode.yml` | Join code OAuth tokens (managed automatically) |
-| `serverlist_config.yml` | Server list name, IP, port, max players |
-| `sessions_serverlist.yml` | Server list OAuth tokens (managed automatically) |
+| `nethernet/connection-id.yml` | The connection ID and signaling account identity, owned by EduGeyser |
+| `extensions/edu/joincode_config.yml` | World name, host name, and max players for join codes |
+| `extensions/edu/sessions_joincode.yml` | Join code OAuth tokens (managed automatically) |
+| `extensions/edu/serverlist_config.yml` | Server list name, IP, port, max players |
+| `extensions/edu/sessions_serverlist.yml` | Server list OAuth tokens (managed automatically) |
+| `extensions/edu/tenant_whitelist.yml` | Allowed tenants |
 
 ## Building
 
@@ -116,4 +138,4 @@ Run `/edu serverlist add` once per tenant. Each requires its own Global Admin ac
 ./gradlew build
 ```
 
-The JAR is output to `build/libs/`. Includes native WebRTC libraries for all platforms (Windows/Linux/macOS, x86_64/aarch64).
+The JAR is output to `build/libs/`. It compiles against the EduGeyser API; the WebRTC transport and its native libraries live in EduGeyser itself.
