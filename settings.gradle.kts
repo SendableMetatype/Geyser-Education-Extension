@@ -1,6 +1,6 @@
 rootProject.name = "EduGeyser-Extension"
 
-val geyserForkDir = file("../GeyserFork")
+val geyserForkDir = file("../EduGeyser")
 if (geyserForkDir.isDirectory) {
     includeBuild(geyserForkDir) {
         dependencySubstitution {
