@@ -301,6 +301,39 @@ public class JoinCodeManager {
         return manager != null ? manager.getConnectionId() : null;
     }
 
+    /**
+     * The connection ID format used by 26.30 and newer clients: the connection
+     * id followed by the 32 hex pmid of Geyser's signaling MCToken. The pmid
+     * is bound to the anonymous PlayFab account (re-auth with the same CustomId
+     * keeps it, verified), whose identity Geyser persists beside the connection
+     * id, so the value is stable across restarts. It is still read live here
+     * because the pmid only exists once signaling has authenticated.
+     */
+    private @Nullable String getNewFormatConnectionId() {
+        NethernetManager manager = extension.geyserApi().nethernetManager();
+        if (manager == null) {
+            return null;
+        }
+        String connectionId = manager.getConnectionId();
+        String pmsgId = manager.getPmsgId();
+        if (connectionId == null || pmsgId == null) {
+            return null;
+        }
+        return connectionId + pmsgId.replace("-", "").toLowerCase();
+    }
+
+    private static String aliveMarker(boolean alive) {
+        return " (" + (alive ? "alive" : "dead") + ")";
+    }
+
+    private void logConnectionIds() {
+        extension.logger().info(LOG_PREFIX + "Connection ID (1.21.133 and older): " + getConnectionId());
+        String newFormatId = getNewFormatConnectionId();
+        if (newFormatId != null) {
+            extension.logger().info(LOG_PREFIX + "Connection ID (26.30 and newer): " + newFormatId);
+        }
+    }
+
     // ---- Heartbeat (per account) ----
 
     private void scheduleHeartbeat(JoinCodeAccount account) {
@@ -366,14 +399,14 @@ public class JoinCodeManager {
             for (JoinCodeAccount a : accounts) {
                 if (a.rehosting) {
                     if (!any) {
-                        extension.logger().info(LOG_PREFIX + "Connection ID: " + getConnectionId());
+                        logConnectionIds();
                         any = true;
                     }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() +
                             ": trying to obtain a new join code...");
                 } else if (a.active && a.humanReadableCode != null && a.passcode != null) {
                     if (!any) {
-                        extension.logger().info(LOG_PREFIX + "Connection ID: " + getConnectionId());
+                        logConnectionIds();
                         any = true;
                     }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() + ": " +
@@ -532,8 +565,16 @@ public class JoinCodeManager {
         source.sendMessage(LOG_PREFIX + "=== Join Codes ===");
         NethernetManager manager = extension.geyserApi().nethernetManager();
         String connectionId = manager != null ? manager.getConnectionId() : "unavailable";
-        boolean alive = manager != null && manager.isSignalingAlive();
-        source.sendMessage("  Connection ID: " + connectionId + " (" + (alive ? "alive" : "dead") + ")");
+        // The two formats ride separate signaling connections (Type 3 WebSocket
+        // for the old format, Type 7 JSON-RPC for the new), so each line gets
+        // its own liveness marker.
+        source.sendMessage("  Connection ID (1.21.133 and older): " + connectionId
+                + aliveMarker(manager != null && manager.isLegacySignalingAlive()));
+        String newFormatId = getNewFormatConnectionId();
+        source.sendMessage("  Connection ID (26.30 and newer): "
+                + (newFormatId != null
+                        ? newFormatId + aliveMarker(manager != null && manager.isRpcSignalingAlive())
+                        : "unavailable"));
         if (accounts.isEmpty()) {
             source.sendMessage("  No join codes registered. Use '/edu joincode add' to add one.");
             return;
