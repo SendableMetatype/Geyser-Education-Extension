@@ -5,7 +5,7 @@
 
 This is the source code of the education extension that ships bundled inside [EduGeyser](https://edugeyser.org/). It installs itself automatically on startup; there is nothing to download and nothing to place in the extensions folder. It handles how Minecraft Education Edition students connect to a server:
 
-1. **Connection ID**: a numeric ID that students enter in Education Edition's connection dialog. Works across all tenants, no accounts needed.
+1. **Connection ID**: a stable ID that students enter in Education Edition's connection dialog. Works across all tenants, no accounts needed.
 2. **Join Codes**: codes that students enter on Education Edition's join code screen, or open through a share link. Each code is tied to one M365 Education tenant.
 3. **Server List**: broadcasts the server to Education Edition's own server browser. Requires Global Admin access to an M365 Education tenant.
 4. **Tenant Whitelist**: optionally restricts which organizations may join.
@@ -66,7 +66,7 @@ max-players: 40
 ### Notes
 
 * The connection ID is persistent across restarts (stored by EduGeyser in `nethernet/connection-id.yml`)
-* Join codes and share links change on every server restart
+* Join codes and share links are restored across restarts while their saved registration remains active; expired registrations are replaced automatically
 * Codes stay alive via heartbeat while the server is running
 * No Global Admin access required, any education account works
 
