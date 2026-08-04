@@ -129,20 +129,35 @@ public class JoinCodeManager {
     }
 
     private void restoreOrAuthenticate(JoinCodeAccount account, int index) throws IOException, InterruptedException {
+        if (shutdownRequested) {
+            return;
+        }
         boolean hasRefresh = account.refreshToken != null && !account.refreshToken.isEmpty();
 
         if (hasRefresh && account.passcode != null) {
+            // Only a failed token refresh means the login itself is broken and
+            // the session is worth discarding. Anything that fails past this
+            // point (Nethernet, Discovery) is infrastructure: the session must
+            // survive it, or a shutdown or outage during restore would erase
+            // the operator's sign in and demand a fresh device code flow.
             try {
                 refreshAccessToken(account);
-                extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) +
-                        " (" + account.displayLabel() + ")...");
-                completeAuthFlow(account, index);
-                logAccountActive(account, index);
-                return;
             } catch (Exception e) {
                 extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) + ", re-authenticating...");
                 clearAccountSession(account);
+                startDeviceCodeFlow(account, index);
+                return;
             }
+            extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) +
+                    " (" + account.displayLabel() + ")...");
+            try {
+                completeAuthFlow(account, index);
+                logAccountActive(account, index);
+            } catch (Exception e) {
+                extension.logger().error(LOG_PREFIX + "Failed to restore the join code for account #" + (index + 1) +
+                        ": " + e.getMessage() + " (sign in kept; restart to retry)");
+            }
+            return;
         }
 
         if (hasRefresh) {
@@ -150,6 +165,13 @@ public class JoinCodeManager {
             clearAccountSession(account);
         }
 
+        startDeviceCodeFlow(account, index);
+    }
+
+    private void startDeviceCodeFlow(JoinCodeAccount account, int index) throws IOException {
+        if (shutdownRequested) {
+            return;
+        }
         doDeviceCodeFlow(account, index).thenRun(() -> {
             try {
                 completeAuthFlow(account, index);
@@ -168,14 +190,18 @@ public class JoinCodeManager {
             throw new IOException("Nethernet server not available");
         }
 
-        String connectionId = getConnectionId();
+        NetworkIdParts parts = requireNetworkIdParts();
         account.discoveryClient = new DiscoveryClient(extension.logger(), account.accessToken);
 
         // Try to resume the existing registration so the join code survives a restart.
-        // Only safe when we have a saved code and the connection id it was hosted with
-        // still matches, since the registration points at that id on the server.
+        // Only safe when we have a saved code and both halves of the networkId it was
+        // hosted with still match: the user editable connection id number and Geyser's
+        // account bound pmid each invalidate the registration when they change.
+        // Sessions saved before the envelope switch have no pmid, fail the match, and
+        // re-host in the new format automatically.
         boolean canResume = account.serverToken != null && account.passcode != null
-                && account.connectionId != null && account.connectionId.equals(connectionId);
+                && parts.connectionId().equals(account.connectionId)
+                && parts.pmid().equals(account.pmid);
         if (canResume) {
             account.discoveryClient.setServerToken(account.serverToken);
             account.discoveryClient.setPasscode(account.passcode);
@@ -193,9 +219,17 @@ public class JoinCodeManager {
             // The saved registration has expired. Fall through and host a new code.
             extension.logger().debug(LOG_PREFIX + "Saved join code no longer active; hosting a new one for tenant " +
                     account.displayLabel());
+        } else if (account.serverToken != null && account.passcode != null) {
+            // A saved registration exists but points at different networkId
+            // halves: an edited connection id, a reset account identity, or a
+            // session from before the envelope switch. Its code dies here, so
+            // say so instead of silently handing out a different one.
+            extension.logger().info(LOG_PREFIX + "Saved join code for tenant " + account.displayLabel() +
+                    " was registered with a different connection identity; hosting a new one" +
+                    " (the old code and share link no longer work)");
         }
 
-        String code = account.discoveryClient.host(connectionId, worldName, hostName, maxPlayers);
+        String code = account.discoveryClient.host(parts.envelope(), worldName, hostName, maxPlayers);
         if (code == null) {
             throw new IOException("Failed to register with Discovery API");
         }
@@ -203,7 +237,8 @@ public class JoinCodeManager {
         account.humanReadableCode = code;
         account.passcode = account.discoveryClient.getPasscode();
         account.serverToken = account.discoveryClient.getServerToken();
-        account.connectionId = connectionId;
+        account.connectionId = parts.connectionId();
+        account.pmid = parts.pmid();
         account.extractTenantId();
         account.rehosting = false;
         account.active = true;
@@ -296,20 +331,34 @@ public class JoinCodeManager {
         return manager.start();
     }
 
-    private @Nullable String getConnectionId() {
-        NethernetManager manager = extension.geyserApi().nethernetManager();
-        return manager != null ? manager.getConnectionId() : null;
+    /**
+     * The two halves of the networkId that join codes are registered with: the
+     * user editable connection id number from connection-id.yml and the 32 hex
+     * pmid of Geyser's signaling MCToken. The pmid is bound to the anonymous
+     * PlayFab account (re-auth with the same CustomId keeps it, verified),
+     * whose identity Geyser persists beside the connection id, so both halves
+     * are stable across restarts while their files are untouched.
+     */
+    private record NetworkIdParts(String connectionId, String pmid) {
+
+        /**
+         * The Discovery networkId registered for join codes: the JSON
+         * envelope form of the two halves. Clients require pure JSON here (a
+         * digits prefix breaks their parsing). Pre-26.x clients could not use
+         * an envelope registration, but they died with the 26.32 auto update,
+         * along with the Type 3 signaling their numeric registrations pointed
+         * at.
+         */
+        String envelope() {
+            JsonObject envelope = new JsonObject();
+            envelope.addProperty("nnid", connectionId);
+            envelope.addProperty("pmid", pmid);
+            envelope.addProperty("type", "jsonrpc");
+            return envelope.toString();
+        }
     }
 
-    /**
-     * The connection ID format used by 26.30 and newer clients: the connection
-     * id followed by the 32 hex pmid of Geyser's signaling MCToken. The pmid
-     * is bound to the anonymous PlayFab account (re-auth with the same CustomId
-     * keeps it, verified), whose identity Geyser persists beside the connection
-     * id, so the value is stable across restarts. It is still read live here
-     * because the pmid only exists once signaling has authenticated.
-     */
-    private @Nullable String getNewFormatConnectionId() {
+    private @Nullable NetworkIdParts getNetworkIdParts() {
         NethernetManager manager = extension.geyserApi().nethernetManager();
         if (manager == null) {
             return null;
@@ -319,19 +368,38 @@ public class JoinCodeManager {
         if (connectionId == null || pmsgId == null) {
             return null;
         }
-        return connectionId + pmsgId.replace("-", "").toLowerCase();
+        return new NetworkIdParts(connectionId, pmsgId.replace("-", "").toLowerCase());
+    }
+
+    /**
+     * Both halves are available the moment ensureNethernet() has returned
+     * true: the manager's start() runs the whole PlayFab chain synchronously
+     * and the pmid comes out of exactly that MCToken. A missing pmid means
+     * the MCToken carries no pmid claim at all, which waiting cannot fix, so
+     * this fails immediately rather than retrying.
+     */
+    private NetworkIdParts requireNetworkIdParts() throws IOException {
+        NetworkIdParts parts = getNetworkIdParts();
+        if (parts == null) {
+            throw new IOException("no connection id or pmid available (MCToken without a pmid claim?)");
+        }
+        return parts;
+    }
+
+    /** The connection ID clients type: the two halves concatenated. */
+    private @Nullable String getFullConnectionId() {
+        NetworkIdParts parts = getNetworkIdParts();
+        return parts != null ? parts.connectionId() + parts.pmid() : null;
     }
 
     private static String aliveMarker(boolean alive) {
         return " (" + (alive ? "alive" : "dead") + ")";
     }
 
-    private void logConnectionIds() {
-        extension.logger().info(LOG_PREFIX + "Connection ID (1.21.133 and older): " + getConnectionId());
-        String newFormatId = getNewFormatConnectionId();
-        if (newFormatId != null) {
-            extension.logger().info(LOG_PREFIX + "Connection ID (26.30 and newer): " + newFormatId);
-        }
+    private void logConnectionId() {
+        String connectionId = getFullConnectionId();
+        extension.logger().info(LOG_PREFIX + "Connection ID: "
+                + (connectionId != null ? connectionId : "unavailable"));
     }
 
     // ---- Heartbeat (per account) ----
@@ -341,6 +409,18 @@ public class JoinCodeManager {
             if (shutdownRequested || !account.active) return;
             DiscoveryClient client = account.discoveryClient;
             if (client == null) return;
+            // Heartbeats carry no networkId, so Discovery keeps a registration
+            // alive even when its envelope points at halves we no longer hold.
+            // If either half drifted under the running process, the code
+            // resolves to a dead identity; detect that here and rehost.
+            NetworkIdParts parts = getNetworkIdParts();
+            if (parts != null && (!parts.connectionId().equals(account.connectionId)
+                    || !parts.pmid().equals(account.pmid))) {
+                extension.logger().warning(LOG_PREFIX + "Connection identity changed; the join code for tenant " +
+                        account.displayLabel() + " points at the old identity, hosting a new one...");
+                rehost(account);
+                return;
+            }
             switch (client.heartbeat()) {
                 case OK -> account.rehosting = false;
                 case TRANSIENT -> extension.logger().warning(LOG_PREFIX + "Heartbeat failed for tenant " +
@@ -367,12 +447,9 @@ public class JoinCodeManager {
                 "for tenant " + account.displayLabel() + " is no longer valid, trying to obtain a new one...");
         try {
             refreshAccessToken(account);
-            String connectionId = getConnectionId();
-            if (connectionId == null) {
-                throw new IOException("Nethernet connection ID unavailable");
-            }
+            NetworkIdParts parts = requireNetworkIdParts();
             DiscoveryClient client = new DiscoveryClient(extension.logger(), account.accessToken);
-            String code = client.host(connectionId, worldName, hostName, maxPlayers);
+            String code = client.host(parts.envelope(), worldName, hostName, maxPlayers);
             if (code == null) {
                 throw new IOException("Failed to register with Discovery API");
             }
@@ -380,7 +457,8 @@ public class JoinCodeManager {
             account.humanReadableCode = code;
             account.passcode = client.getPasscode();
             account.serverToken = client.getServerToken();
-            account.connectionId = connectionId;
+            account.connectionId = parts.connectionId();
+            account.pmid = parts.pmid();
             account.extractTenantId();
             account.rehosting = false;
             saveAllAccounts();
@@ -399,14 +477,14 @@ public class JoinCodeManager {
             for (JoinCodeAccount a : accounts) {
                 if (a.rehosting) {
                     if (!any) {
-                        logConnectionIds();
+                        logConnectionId();
                         any = true;
                     }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() +
                             ": trying to obtain a new join code...");
                 } else if (a.active && a.humanReadableCode != null && a.passcode != null) {
                     if (!any) {
-                        logConnectionIds();
+                        logConnectionId();
                         any = true;
                     }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() + ": " +
@@ -564,16 +642,10 @@ public class JoinCodeManager {
     private void showStatus(CommandSource source) {
         source.sendMessage(LOG_PREFIX + "=== Join Codes ===");
         NethernetManager manager = extension.geyserApi().nethernetManager();
-        String connectionId = manager != null ? manager.getConnectionId() : "unavailable";
-        // The two formats ride separate signaling connections (Type 3 WebSocket
-        // for the old format, Type 7 JSON-RPC for the new), so each line gets
-        // its own liveness marker.
-        source.sendMessage("  Connection ID (1.21.133 and older): " + connectionId
-                + aliveMarker(manager != null && manager.isLegacySignalingAlive()));
-        String newFormatId = getNewFormatConnectionId();
-        source.sendMessage("  Connection ID (26.30 and newer): "
-                + (newFormatId != null
-                        ? newFormatId + aliveMarker(manager != null && manager.isRpcSignalingAlive())
+        String connectionId = getFullConnectionId();
+        source.sendMessage("  Connection ID: "
+                + (connectionId != null
+                        ? connectionId + aliveMarker(manager != null && manager.isSignalingAlive())
                         : "unavailable"));
         if (accounts.isEmpty()) {
             source.sendMessage("  No join codes registered. Use '/edu joincode add' to add one.");
@@ -648,6 +720,7 @@ public class JoinCodeManager {
                         a.passcode = node.node("passcode").getString();
                         a.serverToken = node.node("server-token").getString();
                         a.connectionId = node.node("connection-id").getString();
+                        a.pmid = node.node("pmid").getString();
                         a.extractTenantId();
                         a.extractTokenClaims();
                         if (a.passcode != null) {
@@ -677,6 +750,7 @@ public class JoinCodeManager {
                     sb.append("    passcode: ").append(yamlStr(a.passcode)).append("\n");
                     sb.append("    server-token: ").append(yamlStr(a.serverToken)).append("\n");
                     sb.append("    connection-id: ").append(yamlStr(a.connectionId)).append("\n");
+                    sb.append("    pmid: ").append(yamlStr(a.pmid)).append("\n");
                 }
                 Files.writeString(path, sb.toString());
             } catch (Exception e) {
@@ -692,6 +766,7 @@ public class JoinCodeManager {
         account.passcode = null;
         account.serverToken = null;
         account.connectionId = null;
+        account.pmid = null;
         account.humanReadableCode = null;
         account.rehosting = false;
         account.active = false;

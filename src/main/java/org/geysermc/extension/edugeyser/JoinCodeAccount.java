@@ -19,10 +19,15 @@ public class JoinCodeAccount {
     volatile @Nullable String accessToken;
     volatile long accessTokenExpires;
 
-    // Discovery state
+    // Discovery state. The registered networkId is the envelope built from
+    // connectionId and pmid; they are persisted separately because they have
+    // different owners: the connection id number is user editable in
+    // connection-id.yml, while the pmid follows Geyser's internal PlayFab
+    // account identity. A change in either half invalidates the registration.
     volatile @Nullable String passcode;
     volatile @Nullable String serverToken;
     volatile @Nullable String connectionId;
+    volatile @Nullable String pmid;
 
     // Runtime (not persisted)
     volatile @Nullable String tenantId;

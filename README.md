@@ -14,14 +14,13 @@ Full user documentation lives on the website: [edugeyser.org/wiki/geyser/educati
 
 ## Connection ID
 
-The connection ID is generated and owned by EduGeyser itself, not by this extension. It is stored in `nethernet/connection-id.yml` inside the Geyser folder, persists across restarts, and is printed to the console on every startup. There are two formats, one per client generation, each printed with a matching label:
+The connection ID is generated and owned by EduGeyser itself, not by this extension. It is stored in `nethernet/connection-id.yml` inside the Geyser folder, persists across restarts, and is printed to the console on every startup:
 
 ```
-[Nethernet] Listening on connection ID (1.21.133 and older): 123456789012345678
-[Nethernet] Connection ID (26.30 and newer): 1234567890123456785daffd38c5bbac52ba313d53d9354b58
+[Nethernet] Listening on connection ID: 1234567890123456785daffd38c5bbac52ba313d53d9354b58
 ```
 
-The 26.30 format is the same ID followed by an account identifier that EduGeyser stores alongside it, so both formats are stable across restarts. Generated IDs are 18 digits; edited values may be 10 to 18 digits. Delete the file to generate a fresh one, which also resets the 26.30 format. Keep the ID random, predictable numbers invite collisions with other servers.
+The ID is a number stored in the file followed by an account identifier that EduGeyser stores alongside it, so the full value is stable across restarts. Generated numbers are 18 digits; edited values may be 10 to 18 digits. Delete the file to generate a fresh one, which regenerates both halves. Keep the number random, predictable values invite collisions with other servers.
 
 Students connect by opening Education Edition, pressing **Play**, then **Join World**, then the small **...** button to the right of the confirm button. In this dialog they can enter the connection ID to join.
 
@@ -38,7 +37,7 @@ Join codes let students connect by entering symbols on Education Edition's join 
     * **Join code link** for joining with one click: `https://education.minecraft.net/joinworld/...`
     * **Connection ID**, which works across any tenant
 
-While at least one join code is active, the connection IDs and all codes are printed to the console every 3 minutes as a reminder.
+While at least one join code is active, the connection ID and all codes are printed to the console every 3 minutes as a reminder.
 
 ### Multiple Tenants
 
@@ -58,7 +57,7 @@ max-players: 40
 
 | Command | Description |
 |---------|-------------|
-| `/edu joincode` | Show the connection IDs, active join codes, and share links |
+| `/edu joincode` | Show the connection ID, active join codes, and share links |
 | `/edu joincode add` | Create a join code for a new tenant |
 | `/edu joincode remove <number>` | Remove a join code by its index |
 | `/edu joincode rebuild` | Force a rebuild of the signaling connection |
@@ -138,4 +137,4 @@ All paths are relative to the Geyser folder, which depends on your platform: `pl
 ./gradlew build
 ```
 
-The JAR is output to `build/libs/`. It compiles against the EduGeyser API; the WebRTC transport and its native libraries live in EduGeyser itself.
+The JAR is output to `build/libs/`. It compiles against the EduGeyser API through the composite build in `settings.gradle.kts`, which substitutes the api and core dependencies with a sibling [EduGeyser](https://codeberg.org/SendableMetatype/EduGeyser) checkout at `../EduGeyser` built from source. Keep that checkout present and current. The WebRTC transport and its native libraries live in EduGeyser itself.
