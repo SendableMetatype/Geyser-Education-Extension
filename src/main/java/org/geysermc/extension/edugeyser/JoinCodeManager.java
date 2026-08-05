@@ -43,13 +43,17 @@ public class JoinCodeManager {
     private static final String LOG_PREFIX = "[JoinCode] ";
     private static final int HTTP_TIMEOUT = 15000;
     private static final long HEARTBEAT_INTERVAL_SECONDS = 100;
-    private static final long CODE_REMINDER_INTERVAL_SECONDS = 180;
+    private static final long RESTORE_RETRY_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_SECONDS;
+    private static final long ACCESS_TOKEN_REFRESH_MARGIN_SECONDS = 60;
+    private static final long CODE_REMINDER_INTERVAL_SECONDS = 900;
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
     private final Object fileLock = new Object();
     private final List<JoinCodeAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<JoinCodeAccount, List<ScheduledFuture<?>>> accountTasks = new ConcurrentHashMap<>();
+    private final Map<JoinCodeAccount, ScheduledFuture<?>> restoreRetryTasks = new ConcurrentHashMap<>();
+    private final Map<JoinCodeAccount, ScheduledFuture<?>> deviceCodeRetryTasks = new ConcurrentHashMap<>();
     private volatile @Nullable ScheduledFuture<?> codeReminderTask;
     private volatile boolean shutdownRequested;
 
@@ -99,6 +103,14 @@ public class JoinCodeManager {
         for (List<ScheduledFuture<?>> tasks : accountTasks.values()) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
+        for (ScheduledFuture<?> task : restoreRetryTasks.values()) {
+            task.cancel(false);
+        }
+        restoreRetryTasks.clear();
+        for (ScheduledFuture<?> task : deviceCodeRetryTasks.values()) {
+            task.cancel(false);
+        }
+        deviceCodeRetryTasks.clear();
 
         // We deliberately do not dehost on shutdown. Leaving the registration in
         // place lets the next startup resume the same join code, since the server
@@ -134,18 +146,29 @@ public class JoinCodeManager {
         }
         boolean hasRefresh = account.refreshToken != null && !account.refreshToken.isEmpty();
 
-        if (hasRefresh && account.passcode != null) {
-            // Only a failed token refresh means the login itself is broken and
-            // the session is worth discarding. Anything that fails past this
-            // point (Nethernet, Discovery) is infrastructure: the session must
-            // survive it, or a shutdown or outage during restore would erase
-            // the operator's sign in and demand a fresh device code flow.
+        if (hasRefresh) {
+            // Any refresh token is worth restoring, even without a saved
+            // registration (auth succeeded but hosting failed before the last
+            // shutdown): completeAuthFlow hosts a fresh code when none can be
+            // resumed. The session is only discarded when Entra definitively
+            // rejects the refresh token. A transient refresh failure
+            // (network, 5xx) or anything that fails past this point
+            // (Nethernet, Discovery) is infrastructure: the session must
+            // survive it, or an outage during restore would erase the
+            // operator's sign in and demand a fresh device code flow.
             try {
                 refreshAccessToken(account);
             } catch (Exception e) {
-                extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) + ", re-authenticating...");
-                clearAccountSession(account);
-                startDeviceCodeFlow(account, index);
+                if (isLoginRejected(e)) {
+                    extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
+                            " was rejected, re-authenticating...");
+                    extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                    reauthenticate(account, index);
+                } else {
+                    extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) +
+                            ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                    scheduleRestoreRetry(account, index);
+                }
                 return;
             }
             extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) +
@@ -155,34 +178,76 @@ public class JoinCodeManager {
                 logAccountActive(account, index);
             } catch (Exception e) {
                 extension.logger().error(LOG_PREFIX + "Failed to restore the join code for account #" + (index + 1) +
-                        ": " + e.getMessage() + " (sign in kept; restart to retry)");
+                        ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                scheduleRestoreRetry(account, index);
             }
             return;
-        }
-
-        if (hasRefresh) {
-            extension.logger().debug(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
-            clearAccountSession(account);
         }
 
         startDeviceCodeFlow(account, index);
     }
 
-    private void startDeviceCodeFlow(JoinCodeAccount account, int index) throws IOException {
-        if (shutdownRequested) {
+    /**
+     * Runs the device code flow for an unattended context (startup restore or
+     * forced reauthentication; the /edu joincode add command has its own
+     * handling). Every terminal failure schedules its own recovery, since no
+     * other task exists for the account at this point and the alternative is
+     * an account that sits idle until a restart.
+     */
+    private void startDeviceCodeFlow(JoinCodeAccount account, int index) {
+        cancelDeviceCodeRetry(account);
+        if (shutdownRequested || !accounts.contains(account)) {
             return;
         }
-        doDeviceCodeFlow(account, index).thenRun(() -> {
-            try {
-                completeAuthFlow(account, index);
-                logAccountActive(account, index);
-            } catch (Exception e) {
-                extension.logger().error(LOG_PREFIX + "Failed to start join code for account #" + (index + 1) + ": " + e.getMessage());
-            }
-        }).exceptionally(ex -> {
-            extension.logger().error(LOG_PREFIX + "Auth failed for account #" + (index + 1) + ": " + ex.getMessage());
-            return null;
-        });
+        try {
+            doDeviceCodeFlow(account, index).thenRun(() -> {
+                // The sign in can complete long after it was requested; the
+                // account may have been removed or the server stopped since.
+                if (shutdownRequested || !accounts.contains(account)) {
+                    return;
+                }
+                try {
+                    completeAuthFlow(account, index);
+                    logAccountActive(account, index);
+                } catch (Exception e) {
+                    extension.logger().error(LOG_PREFIX + "Failed to start join code for account #" + (index + 1) +
+                            ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                    scheduleRestoreRetry(account, index);
+                }
+            }).exceptionally(ex -> {
+                // The sign in never completed, typically an expired device
+                // code. Prompt again with a fresh one.
+                extension.logger().error(LOG_PREFIX + "Auth failed for account #" + (index + 1) + ": " + ex.getMessage());
+                scheduleDeviceCodeRetry(account, index);
+                return null;
+            });
+        } catch (Exception e) {
+            // The device code request itself failed (network); no banner was
+            // shown yet, retry quietly.
+            extension.logger().warning(LOG_PREFIX + "Could not start the sign in for account #" + (index + 1) +
+                    ": " + e.getMessage() + " (retrying in " + RESTORE_RETRY_INTERVAL_SECONDS + " seconds)");
+            scheduleDeviceCodeRetry(account, index);
+        }
+    }
+
+    private void scheduleDeviceCodeRetry(JoinCodeAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            return;
+        }
+        deviceCodeRetryTasks.computeIfAbsent(account, ignored -> scheduler.schedule(() -> {
+            deviceCodeRetryTasks.remove(account);
+            startDeviceCodeFlow(account, index);
+        }, RESTORE_RETRY_INTERVAL_SECONDS, TimeUnit.SECONDS));
+        if (shutdownRequested || !accounts.contains(account)) {
+            cancelDeviceCodeRetry(account);
+        }
+    }
+
+    private void cancelDeviceCodeRetry(JoinCodeAccount account) {
+        ScheduledFuture<?> task = deviceCodeRetryTasks.remove(account);
+        if (task != null) {
+            task.cancel(false);
+        }
     }
 
     private void completeAuthFlow(JoinCodeAccount account, int index) throws Exception {
@@ -247,6 +312,94 @@ public class JoinCodeManager {
         saveAllAccounts();
     }
 
+    private void scheduleRestoreRetry(JoinCodeAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            return;
+        }
+        account.rehosting = true;
+        restoreRetryTasks.computeIfAbsent(account, ignored -> scheduler.scheduleWithFixedDelay(
+                () -> retryRestore(account, index),
+                RESTORE_RETRY_INTERVAL_SECONDS,
+                RESTORE_RETRY_INTERVAL_SECONDS,
+                TimeUnit.SECONDS));
+    }
+
+    private void retryRestore(JoinCodeAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            cancelRestoreRetry(account);
+            return;
+        }
+        try {
+            long now = System.currentTimeMillis() / 1000;
+            if (account.accessToken == null
+                    || account.accessTokenExpires <= now + ACCESS_TOKEN_REFRESH_MARGIN_SECONDS) {
+                try {
+                    refreshAccessToken(account);
+                } catch (Exception e) {
+                    if (isLoginRejected(e)) {
+                        extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
+                                " was rejected, re-authenticating...");
+                        extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                        reauthenticate(account, index);
+                        return;
+                    }
+                    throw e;
+                }
+            }
+            completeAuthFlow(account, index);
+            cancelRestoreRetry(account);
+            logAccountActive(account, index);
+        } catch (Exception e) {
+            extension.logger().warning(LOG_PREFIX + "Join code restore retry failed for account #" + (index + 1) +
+                    ": " + e.getMessage() + " (retrying in " + RESTORE_RETRY_INTERVAL_SECONDS + " seconds)");
+        }
+    }
+
+    private void cancelRestoreRetry(JoinCodeAccount account) {
+        ScheduledFuture<?> task = restoreRetryTasks.remove(account);
+        if (task != null) {
+            task.cancel(false);
+        }
+    }
+
+    /**
+     * Whether an exception from the Entra token endpoint means the saved
+     * login itself is dead. Per Microsoft's token endpoint error reference,
+     * invalid_grant (an expired or revoked refresh token), interaction_required,
+     * and consent_required all demand a new interactive sign in; everything
+     * else (network failures, server_error, temporarily_unavailable) is
+     * retryable without touching the session. The endpoint's response body
+     * rides in the exception message, the same mechanism the device code
+     * poller uses for authorization_pending and slow_down.
+     */
+    private static boolean isLoginRejected(Exception e) {
+        String msg = e.getMessage();
+        return msg != null && (msg.contains("invalid_grant")
+                || msg.contains("interaction_required")
+                || msg.contains("consent_required"));
+    }
+
+    /**
+     * The saved refresh token was definitively rejected; only a fresh device
+     * code sign in can revive the account. Cancels the account's scheduled
+     * work first so the eventual completeAuthFlow schedules its heartbeat
+     * exactly once.
+     */
+    private void reauthenticate(JoinCodeAccount account, int index) {
+        cancelRestoreRetry(account);
+        cancelDeviceCodeRetry(account);
+        cancelAccountTasks(account);
+        clearAccountSession(account);
+        startDeviceCodeFlow(account, index);
+    }
+
+    private void cancelAccountTasks(JoinCodeAccount account) {
+        List<ScheduledFuture<?>> tasks = accountTasks.remove(account);
+        if (tasks != null) {
+            for (ScheduledFuture<?> task : tasks) task.cancel(false);
+        }
+    }
+
     private void logAccountActive(JoinCodeAccount account, int index) {
         extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " active: " +
                 (account.humanReadableCode != null ? account.humanReadableCode : "unknown") +
@@ -265,6 +418,11 @@ public class JoinCodeManager {
         scheduler.execute(() -> {
             try {
                 doDeviceCodeFlow(account, index).thenRun(() -> {
+                    // Same guard as the unattended flow: the account may have
+                    // been removed or the server stopped during the sign in.
+                    if (shutdownRequested || !accounts.contains(account)) {
+                        return;
+                    }
                     try {
                         completeAuthFlow(account, index);
                         source.sendMessage(LOG_PREFIX + "Join code #" + (index + 1) + " active: " +
@@ -299,10 +457,9 @@ public class JoinCodeManager {
         }
         JoinCodeAccount account = accounts.get(index);
 
-        List<ScheduledFuture<?>> tasks = accountTasks.remove(account);
-        if (tasks != null) {
-            for (ScheduledFuture<?> task : tasks) task.cancel(false);
-        }
+        cancelRestoreRetry(account);
+        cancelDeviceCodeRetry(account);
+        cancelAccountTasks(account);
 
         // No dehost. With its heartbeat task cancelled above, the code stops being
         // beaten and ages out on its own within the server's window.
@@ -446,7 +603,21 @@ public class JoinCodeManager {
                 (account.humanReadableCode != null ? account.humanReadableCode + " " : "") +
                 "for tenant " + account.displayLabel() + " is no longer valid, trying to obtain a new one...");
         try {
-            refreshAccessToken(account);
+            try {
+                refreshAccessToken(account);
+            } catch (Exception e) {
+                if (isLoginRejected(e)) {
+                    int index = accounts.indexOf(account);
+                    extension.logger().warning(LOG_PREFIX + "The login for tenant " + account.displayLabel() +
+                            " was rejected, re-authenticating...");
+                    extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                    if (index >= 0) {
+                        reauthenticate(account, index);
+                    }
+                    return;
+                }
+                throw e;
+            }
             NetworkIdParts parts = requireNetworkIdParts();
             DiscoveryClient client = new DiscoveryClient(extension.logger(), account.accessToken);
             String code = client.host(parts.envelope(), worldName, hostName, maxPlayers);
@@ -473,20 +644,14 @@ public class JoinCodeManager {
     private void scheduleCodeReminder() {
         codeReminderTask = scheduler.scheduleAtFixedRate(() -> {
             if (shutdownRequested) return;
-            boolean any = false;
+            // The connection ID works without any join code, so it is always
+            // worth reprinting.
+            logConnectionId();
             for (JoinCodeAccount a : accounts) {
                 if (a.rehosting) {
-                    if (!any) {
-                        logConnectionId();
-                        any = true;
-                    }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() +
                             ": trying to obtain a new join code...");
                 } else if (a.active && a.humanReadableCode != null && a.passcode != null) {
-                    if (!any) {
-                        logConnectionId();
-                        any = true;
-                    }
                     extension.logger().info(LOG_PREFIX + "  " + a.displayLabel() + ": " +
                             a.humanReadableCode + " | " + DiscoveryClient.createShareLink(a.passcode));
                 }

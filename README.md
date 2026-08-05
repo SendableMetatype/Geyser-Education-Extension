@@ -37,7 +37,7 @@ Join codes let students connect by entering symbols on Education Edition's join 
     * **Join code link** for joining with one click: `https://education.minecraft.net/joinworld/...`
     * **Connection ID**, which works across any tenant
 
-While at least one join code is active, the connection ID and all codes are printed to the console every 3 minutes as a reminder.
+The connection ID, along with any active join codes and their share links, is printed to the console every 15 minutes as a reminder.
 
 ### Multiple Tenants
 

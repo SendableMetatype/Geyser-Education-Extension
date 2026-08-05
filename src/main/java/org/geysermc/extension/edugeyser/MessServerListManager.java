@@ -49,6 +49,7 @@ public class MessServerListManager {
     private static final String LOG_PREFIX = "[EduServerList] ";
     private static final int HTTP_TIMEOUT = 15000;
     private static final long TOKEN_EXPIRY_BUFFER_SECONDS = 60;
+    private static final long RESTORE_RETRY_INTERVAL_SECONDS = 100;
     private static final int MESS_HEALTH_OPTIMAL = 2;
     // The server list tile only changes visually with the player count, so updates are
     // sent on change. MESS quietly decays the DISPLAYED health of servers whose last
@@ -69,6 +70,8 @@ public class MessServerListManager {
     private final Object configFileLock = new Object();
     private final List<ServerListAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<ServerListAccount, List<ScheduledFuture<?>>> accountTasks = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<ServerListAccount, ScheduledFuture<?>> restoreRetryTasks = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<ServerListAccount, ScheduledFuture<?>> deviceCodeRetryTasks = new java.util.concurrent.ConcurrentHashMap<>();
     private volatile boolean shutdownRequested;
     private volatile boolean serverListEndpointAvailable = true;
 
@@ -101,6 +104,14 @@ public class MessServerListManager {
         for (List<ScheduledFuture<?>> tasks : accountTasks.values()) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
+        for (ScheduledFuture<?> task : restoreRetryTasks.values()) {
+            task.cancel(false);
+        }
+        restoreRetryTasks.clear();
+        for (ScheduledFuture<?> task : deviceCodeRetryTasks.values()) {
+            task.cancel(false);
+        }
+        deviceCodeRetryTasks.clear();
 
         for (ServerListAccount account : accounts) {
             if (account.serverToken != null) {
@@ -162,38 +173,196 @@ public class MessServerListManager {
     }
 
     private void restoreOrAuthenticate(ServerListAccount account, int index) throws IOException, InterruptedException {
+        if (shutdownRequested) {
+            return;
+        }
         boolean hasTooling = account.refreshToken != null && !account.refreshToken.isEmpty();
         boolean hasEdu = account.eduRefreshToken != null && !account.eduRefreshToken.isEmpty();
 
-        if (hasTooling && hasEdu && account.serverId != null && !account.serverId.isEmpty()) {
+        if (hasTooling && hasEdu) {
+            // A complete token pair is worth restoring even without a saved
+            // serverId (auth succeeded but registration never completed):
+            // completeAuthFlow registers a new server in that case. Sessions
+            // are only discarded when Entra definitively rejects a refresh
+            // token; transient failures (network, 5xx, the recurring MESS
+            // 504s) keep both Global Admin sign ins and retry, since re-auth
+            // here costs two device code flows.
             try {
                 ensureValidAccessToken(account);
                 ensureValidEduAccessToken(account);
-                extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) + " (" + account.displayLabel() + ")");
-                completeAuthFlow(account, index);
-                return;
             } catch (Exception e) {
-                // Token refresh or hosting failed - clear session and fall through to re-auth
-                extension.logger().warning(LOG_PREFIX + "Restore failed for account #" + (index + 1) + ", re-authenticating...");
-                clearAccountSession(account);
+                if (isLoginRejected(e)) {
+                    extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
+                            " was rejected, re-authenticating...");
+                    extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                    reauthenticate(account, index);
+                } else {
+                    extension.logger().warning(LOG_PREFIX + "Token refresh failed for account #" + (index + 1) +
+                            ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                    scheduleRestoreRetry(account, index);
+                }
+                return;
             }
+            extension.logger().debug(LOG_PREFIX + "Restoring account #" + (index + 1) + " (" + account.displayLabel() + ")");
+            try {
+                completeAuthFlow(account, index);
+            } catch (Exception e) {
+                extension.logger().error(LOG_PREFIX + "Failed to restore the server list registration for account #" +
+                        (index + 1) + ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                scheduleRestoreRetry(account, index);
+            }
+            return;
         }
 
         if (hasTooling || hasEdu) {
+            // Unlike a missing serverId, half a token pair is genuinely
+            // unusable: both sign ins are required, so a fresh device code
+            // flow is the only way forward.
             extension.logger().debug(LOG_PREFIX + "Partial session for account #" + (index + 1) + ", re-authenticating...");
             clearAccountSession(account);
         }
 
+        startDeviceCodeFlows(account, index);
+    }
+
+    /**
+     * Runs both device code flows for an unattended context (startup restore
+     * or forced reauthentication; the /edu serverlist add command has its own
+     * handling). Every terminal failure schedules its own recovery, since no
+     * other task exists for the account at this point and the alternative is
+     * an account that sits idle until a restart.
+     */
+    private void startDeviceCodeFlows(ServerListAccount account, int index) {
+        cancelDeviceCodeRetry(account);
+        if (shutdownRequested || !accounts.contains(account)) {
+            return;
+        }
         doDeviceCodeFlows(account, index).thenRun(() -> {
+            // The sign ins can complete long after they were requested; the
+            // account may have been removed or the server stopped since.
+            if (shutdownRequested || !accounts.contains(account)) {
+                return;
+            }
             try {
                 completeAuthFlow(account, index);
             } catch (Exception e) {
-                extension.logger().error(LOG_PREFIX + "Auth flow failed for account #" + (index + 1) + ": " + e.getMessage());
+                // Signed in but hosting failed: infrastructure. The account
+                // holds fresh refresh tokens again, so the restore retry loop
+                // takes it from here.
+                extension.logger().error(LOG_PREFIX + "Failed to host the server list registration for account #" +
+                        (index + 1) + ": " + e.getMessage() + " (sign in kept; retrying automatically)");
+                scheduleRestoreRetry(account, index);
             }
         }).exceptionally(ex -> {
+            // The sign in never completed (typically an expired device code)
+            // or the device code request itself failed. Prompt again.
             extension.logger().error(LOG_PREFIX + "Auth failed for account #" + (index + 1) + ": " + ex.getMessage());
+            scheduleDeviceCodeRetry(account, index);
             return null;
         });
+    }
+
+    private void scheduleDeviceCodeRetry(ServerListAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            return;
+        }
+        deviceCodeRetryTasks.computeIfAbsent(account, ignored -> scheduler.schedule(() -> {
+            deviceCodeRetryTasks.remove(account);
+            startDeviceCodeFlows(account, index);
+        }, RESTORE_RETRY_INTERVAL_SECONDS, TimeUnit.SECONDS));
+        if (shutdownRequested || !accounts.contains(account)) {
+            cancelDeviceCodeRetry(account);
+        }
+    }
+
+    private void cancelDeviceCodeRetry(ServerListAccount account) {
+        ScheduledFuture<?> task = deviceCodeRetryTasks.remove(account);
+        if (task != null) {
+            task.cancel(false);
+        }
+    }
+
+    private void scheduleRestoreRetry(ServerListAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            return;
+        }
+        restoreRetryTasks.computeIfAbsent(account, ignored -> scheduler.scheduleWithFixedDelay(
+                () -> retryRestore(account, index),
+                RESTORE_RETRY_INTERVAL_SECONDS,
+                RESTORE_RETRY_INTERVAL_SECONDS,
+                TimeUnit.SECONDS));
+    }
+
+    private void retryRestore(ServerListAccount account, int index) {
+        if (shutdownRequested || !accounts.contains(account)) {
+            cancelRestoreRetry(account);
+            return;
+        }
+        try {
+            try {
+                ensureValidAccessToken(account);
+                ensureValidEduAccessToken(account);
+            } catch (Exception e) {
+                if (isLoginRejected(e)) {
+                    extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
+                            " was rejected, re-authenticating...");
+                    extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                    reauthenticate(account, index);
+                    return;
+                }
+                throw e;
+            }
+            completeAuthFlow(account, index);
+            cancelRestoreRetry(account);
+        } catch (Exception e) {
+            extension.logger().warning(LOG_PREFIX + "Server list restore retry failed for account #" + (index + 1) +
+                    ": " + e.getMessage() + " (retrying in " + RESTORE_RETRY_INTERVAL_SECONDS + " seconds)");
+        }
+    }
+
+    private void cancelRestoreRetry(ServerListAccount account) {
+        ScheduledFuture<?> task = restoreRetryTasks.remove(account);
+        if (task != null) {
+            task.cancel(false);
+        }
+    }
+
+    /**
+     * Whether an exception from the Entra token endpoint means the saved
+     * login itself is dead. Per Microsoft's token endpoint error reference,
+     * invalid_grant (an expired or revoked refresh token), interaction_required,
+     * and consent_required all demand a new interactive sign in; everything
+     * else (network failures, server_error, temporarily_unavailable) is
+     * retryable without touching the session. The endpoint's response body
+     * rides in the exception message.
+     */
+    private static boolean isLoginRejected(Exception e) {
+        String msg = e.getMessage();
+        return msg != null && (msg.contains("invalid_grant")
+                || msg.contains("interaction_required")
+                || msg.contains("consent_required"));
+    }
+
+    /**
+     * A saved refresh token was definitively rejected; only fresh device code
+     * sign ins can revive the account. Cancels the account's scheduled work
+     * first so the eventual completeAuthFlow schedules its tasks exactly
+     * once. The serverId survives clearAccountSession, so the existing MESS
+     * registration is reused after the re-auth.
+     */
+    private void reauthenticate(ServerListAccount account, int index) {
+        cancelRestoreRetry(account);
+        cancelDeviceCodeRetry(account);
+        cancelAccountTasks(account);
+        clearAccountSession(account);
+        startDeviceCodeFlows(account, index);
+    }
+
+    private void cancelAccountTasks(ServerListAccount account) {
+        List<ScheduledFuture<?>> tasks = accountTasks.remove(account);
+        if (tasks != null) {
+            for (ScheduledFuture<?> task : tasks) task.cancel(false);
+        }
     }
 
     // ---- Add Account (command-triggered) ----
@@ -211,6 +380,11 @@ public class MessServerListManager {
 
         scheduler.execute(() -> {
             doDeviceCodeFlows(account, index).thenRun(() -> {
+                // Same guard as the unattended flow: the account may have
+                // been removed or the server stopped during the sign in.
+                if (shutdownRequested || !accounts.contains(account)) {
+                    return;
+                }
                 try {
                     completeAuthFlow(account, index);
                     source.sendMessage(LOG_PREFIX + "Account #" + (index + 1) + " registered successfully!" +
@@ -237,11 +411,9 @@ public class MessServerListManager {
         }
         ServerListAccount account = accounts.get(index);
 
-        // Cancel scheduled tasks for this account
-        List<ScheduledFuture<?>> tasks = accountTasks.remove(account);
-        if (tasks != null) {
-            for (ScheduledFuture<?> task : tasks) task.cancel(false);
-        }
+        cancelRestoreRetry(account);
+        cancelDeviceCodeRetry(account);
+        cancelAccountTasks(account);
 
         accounts.remove(account);
         saveAllAccounts();
@@ -378,64 +550,59 @@ public class MessServerListManager {
 
     // ---- Token Refresh ----
 
-    private boolean refreshAccessToken(ServerListAccount account) {
-        if (account.refreshToken == null) return false;
-        try {
-            String body = "grant_type=refresh_token"
-                    + "&client_id=" + URLEncoder.encode(TOOLING_CLIENT_ID, StandardCharsets.UTF_8)
-                    + "&refresh_token=" + URLEncoder.encode(account.refreshToken, StandardCharsets.UTF_8)
-                    + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-            JsonObject response = postForm(ENTRA_BASE + "/token", body);
-            if (response.has("access_token")) {
-                account.accessToken = response.get("access_token").getAsString();
-                account.refreshToken = response.has("refresh_token")
-                        ? response.get("refresh_token").getAsString() : account.refreshToken;
-                account.accessTokenExpires = parseTokenExpiry(response);
-                account.extractTokenClaims();
-                saveAllAccounts();
-                return true;
-            }
-        } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Tooling token refresh failed: " + e.getMessage());
+    /**
+     * Both refresh helpers throw with the token endpoint's response body in
+     * the message so callers can classify the failure via isLoginRejected;
+     * swallowing it into a boolean would erase the invalid_grant distinction.
+     */
+    private void refreshAccessToken(ServerListAccount account) throws IOException {
+        if (account.refreshToken == null) {
+            throw new IOException("No tooling refresh token available");
         }
-        return false;
+        String body = "grant_type=refresh_token"
+                + "&client_id=" + URLEncoder.encode(TOOLING_CLIENT_ID, StandardCharsets.UTF_8)
+                + "&refresh_token=" + URLEncoder.encode(account.refreshToken, StandardCharsets.UTF_8)
+                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
+        JsonObject response = postForm(ENTRA_BASE + "/token", body);
+        if (!response.has("access_token")) {
+            throw new IOException("Tooling token refresh failed: no access_token in response");
+        }
+        account.accessToken = response.get("access_token").getAsString();
+        account.refreshToken = response.has("refresh_token")
+                ? response.get("refresh_token").getAsString() : account.refreshToken;
+        account.accessTokenExpires = parseTokenExpiry(response);
+        account.extractTokenClaims();
+        saveAllAccounts();
     }
 
-    private boolean refreshEduAccessToken(ServerListAccount account) {
-        if (account.eduRefreshToken == null) return false;
-        try {
-            String body = "grant_type=refresh_token"
-                    + "&client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
-                    + "&refresh_token=" + URLEncoder.encode(account.eduRefreshToken, StandardCharsets.UTF_8)
-                    + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-            JsonObject response = postForm(ENTRA_BASE + "/token", body);
-            if (response.has("access_token")) {
-                account.eduAccessToken = response.get("access_token").getAsString();
-                account.eduRefreshToken = response.has("refresh_token")
-                        ? response.get("refresh_token").getAsString() : account.eduRefreshToken;
-                account.eduAccessTokenExpires = parseTokenExpiry(response);
-                account.extractTokenClaims();
-                saveAllAccounts();
-                return true;
-            }
-        } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Edu token refresh failed: " + e.getMessage());
+    private void refreshEduAccessToken(ServerListAccount account) throws IOException {
+        if (account.eduRefreshToken == null) {
+            throw new IOException("No edu refresh token available");
         }
-        return false;
+        String body = "grant_type=refresh_token"
+                + "&client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
+                + "&refresh_token=" + URLEncoder.encode(account.eduRefreshToken, StandardCharsets.UTF_8)
+                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
+        JsonObject response = postForm(ENTRA_BASE + "/token", body);
+        if (!response.has("access_token")) {
+            throw new IOException("Edu token refresh failed: no access_token in response");
+        }
+        account.eduAccessToken = response.get("access_token").getAsString();
+        account.eduRefreshToken = response.has("refresh_token")
+                ? response.get("refresh_token").getAsString() : account.eduRefreshToken;
+        account.eduAccessTokenExpires = parseTokenExpiry(response);
+        account.extractTokenClaims();
+        saveAllAccounts();
     }
 
-    private void ensureValidAccessToken(ServerListAccount account) throws InterruptedException {
+    private void ensureValidAccessToken(ServerListAccount account) throws IOException {
         if (account.accessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS) return;
-        if (!refreshAccessToken(account)) {
-            throw new InterruptedException("Token refresh failed, re-authentication needed");
-        }
+        refreshAccessToken(account);
     }
 
-    private void ensureValidEduAccessToken(ServerListAccount account) throws InterruptedException {
+    private void ensureValidEduAccessToken(ServerListAccount account) throws IOException {
         if (account.eduAccessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS) return;
-        if (!refreshEduAccessToken(account)) {
-            throw new InterruptedException("Edu token refresh failed, re-authentication needed");
-        }
+        refreshEduAccessToken(account);
     }
 
     // ---- MESS Server Registration ----
@@ -591,22 +758,30 @@ public class MessServerListManager {
     }
 
     private void scheduleTokenRefresh(ServerListAccount account) {
-        String accountLabel = account.displayLabel();
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
+            if (shutdownRequested) return;
             try {
-                boolean accessValid = account.accessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS
-                        || refreshAccessToken(account);
-                boolean eduValid = account.eduAccessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS
-                        || refreshEduAccessToken(account);
-                if (!accessValid || !eduValid) {
-                    extension.logger().error(LOG_PREFIX + "Token refresh failed for account " + accountLabel +
-                            ". Remove and re-add the account to re-authenticate.");
-                    return;
+                try {
+                    ensureValidAccessToken(account);
+                    ensureValidEduAccessToken(account);
+                } catch (Exception e) {
+                    if (isLoginRejected(e)) {
+                        int index = accounts.indexOf(account);
+                        extension.logger().warning(LOG_PREFIX + "The login for tenant " + account.displayLabel() +
+                                " was rejected, re-authenticating...");
+                        extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                        if (index >= 0) {
+                            reauthenticate(account, index);
+                        }
+                        return;
+                    }
+                    throw e;
                 }
                 fetchServerToken(account);
                 saveAllAccounts();
             } catch (Exception e) {
-                extension.logger().error(LOG_PREFIX + "Token refresh failed for account " + accountLabel + ": " + e.getMessage());
+                extension.logger().error(LOG_PREFIX + "Token refresh failed for account " + account.displayLabel() +
+                        ": " + e.getMessage() + " (retried on the next cycle)");
             }
         }, 30, 30, TimeUnit.MINUTES);
         accountTasks.computeIfAbsent(account, k -> new CopyOnWriteArrayList<>()).add(task);
@@ -818,9 +993,9 @@ public class MessServerListManager {
         account.eduRefreshToken = null;
         account.eduAccessToken = null;
         account.eduAccessTokenExpires = 0;
-        account.serverToken = null;
-        account.serverTokenJwt = null;
-        account.serverTokenExpires = 0;
+        // Keep the registration token until completeAuthFlow replaces it. It
+        // remains usable for dehosting if reauthentication is still pending
+        // when the account is removed or the server shuts down.
         account.active = false;
         saveAllAccounts();
     }
