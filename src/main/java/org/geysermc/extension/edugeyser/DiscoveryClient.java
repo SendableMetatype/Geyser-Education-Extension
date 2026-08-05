@@ -22,7 +22,8 @@ import java.util.Base64;
 public class DiscoveryClient {
 
     private static final String DISCOVERY_BASE = "https://discovery.minecrafteduservices.com";
-    private static final int BUILD_NUMBER = 12232001;
+    // As captured from a real 26.x client's /host request.
+    private static final int BUILD_NUMBER = 12630000;
     private static final int HTTP_TIMEOUT = 15000;
 
     /**
