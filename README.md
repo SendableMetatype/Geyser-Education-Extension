@@ -79,7 +79,7 @@ Broadcasts your server to Education Edition's own server browser. Requires Globa
 1. Edit `extensions/edu/serverlist_config.yml`:
 
 ```yaml
-server-name: "My School Server"
+server-name: "Server Name"
 server-ip: "mc.example.com"  # Your public IP or hostname that students connect to.
 server-port: "19132"         # The external port students connect to.
 max-players: 40

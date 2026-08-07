@@ -55,25 +55,36 @@ public class ServerListAccount {
     }
 
     private void extractClaimsFromToken(@Nullable String token) {
-        if (token == null) return;
+        JsonObject claims = parseTokenClaims(token);
+        if (claims == null) return;
+        if (upn == null) {
+            if (claims.has("upn")) {
+                upn = claims.get("upn").getAsString();
+            } else if (claims.has("preferred_username")) {
+                upn = claims.get("preferred_username").getAsString();
+            }
+        }
+        if (tenantId == null && claims.has("tid")) {
+            tenantId = claims.get("tid").getAsString();
+        }
+    }
+
+    static @Nullable String extractTenantIdFromToken(@Nullable String token) {
+        JsonObject claims = parseTokenClaims(token);
+        return claims != null && claims.has("tid") ? claims.get("tid").getAsString() : null;
+    }
+
+    private static @Nullable JsonObject parseTokenClaims(@Nullable String token) {
+        if (token == null) return null;
         try {
             String[] parts = token.split("\\.");
-            if (parts.length < 2) return;
+            if (parts.length < 2) return null;
             String padded = parts[1];
             while (padded.length() % 4 != 0) padded += "=";
             String json = new String(Base64.getUrlDecoder().decode(padded), StandardCharsets.UTF_8);
-            JsonObject claims = JsonParser.parseString(json).getAsJsonObject();
-            if (upn == null) {
-                if (claims.has("upn")) {
-                    upn = claims.get("upn").getAsString();
-                } else if (claims.has("preferred_username")) {
-                    upn = claims.get("preferred_username").getAsString();
-                }
-            }
-            if (tenantId == null && claims.has("tid")) {
-                tenantId = claims.get("tid").getAsString();
-            }
+            return JsonParser.parseString(json).getAsJsonObject();
         } catch (Exception ignored) {
+            return null;
         }
     }
 

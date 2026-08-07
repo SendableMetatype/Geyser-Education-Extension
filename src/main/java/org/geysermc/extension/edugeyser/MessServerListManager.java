@@ -20,17 +20,20 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 /**
  * Manages multiple MESS server list registrations.
@@ -39,17 +42,20 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class MessServerListManager {
 
-    private static final String TOOLING_CLIENT_ID = "1c91b067-6806-44a5-8d2d-3137e625f5b8";
-    private static final String EDU_CLIENT_ID = "b36b1432-1a1c-4c82-9b76-24de1cab42f2";
-    private static final String SCOPE = "16556bfc-5102-43c9-a82a-3ea5e4810689/.default offline_access";
-    private static final String ENTRA_BASE = "https://login.microsoftonline.com/organizations/oauth2/v2.0";
     private static final String MESS_BASE = "https://dedicatedserver.minecrafteduservices.com";
     private static final String CONFIG_FILE = "serverlist_config.yml";
     private static final String SESSION_FILE = "sessions_serverlist.yml";
     private static final String LOG_PREFIX = "[EduServerList] ";
+    private static final String DEFAULT_SERVER_NAME = "Server Name";
     private static final int HTTP_TIMEOUT = 15000;
     private static final long TOKEN_EXPIRY_BUFFER_SECONDS = 60;
     private static final long RESTORE_RETRY_INTERVAL_SECONDS = 100;
+    // Dehosting at shutdown is a courtesy: MESS drops a server from the list on
+    // its own once its updates stop. It therefore never gets more than a moment
+    // of the server's shutdown, however slow or hung the remote side is.
+    private static final long SHUTDOWN_QUIESCENCE_BUDGET_MILLIS = 1000;
+    private static final long SHUTDOWN_DEHOST_BUDGET_MILLIS = 2000;
+    private static final int SHUTDOWN_HTTP_TIMEOUT_MILLIS = 1500;
     private static final int MESS_HEALTH_OPTIMAL = 2;
     // The server list tile only changes visually with the player count, so updates are
     // sent on change. MESS quietly decays the DISPLAYED health of servers whose last
@@ -67,23 +73,29 @@ public class MessServerListManager {
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
+    private final EntraOAuthClient oauthClient;
     private final Object configFileLock = new Object();
     private final List<ServerListAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<ServerListAccount, List<ScheduledFuture<?>>> accountTasks = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<ServerListAccount, ScheduledFuture<?>> restoreRetryTasks = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<ServerListAccount, ScheduledFuture<?>> deviceCodeRetryTasks = new java.util.concurrent.ConcurrentHashMap<>();
-    private volatile boolean shutdownRequested;
+    private final Set<CompletableFuture<?>> authenticationFlows = ConcurrentHashMap.newKeySet();
+    private final ShutdownBarrier shutdownBarrier = new ShutdownBarrier();
     private volatile boolean serverListEndpointAvailable = true;
 
     public MessServerListManager(EduGeyserExtension extension) {
         this.extension = extension;
         this.scheduler = Executors.newScheduledThreadPool(4);
+        this.oauthClient = new EntraOAuthClient(scheduler, shutdownBarrier::isShutdownRequested);
     }
 
     // ---- Lifecycle ----
 
     public void initialize() {
         loadAllAccounts();
+        if (!serverListEndpointAvailable) {
+            return;
+        }
 
         if (!resolveServerListEndpoint()) {
             extension.logger().error(LOG_PREFIX + "Could not auto-detect a public server IP. " +
@@ -100,7 +112,10 @@ public class MessServerListManager {
     }
 
     public void shutdown() {
-        shutdownRequested = true;
+        shutdownBarrier.requestShutdown();
+        for (CompletableFuture<?> flow : authenticationFlows) {
+            flow.cancel(false);
+        }
         for (List<ScheduledFuture<?>> tasks : accountTasks.values()) {
             for (ScheduledFuture<?> task : tasks) task.cancel(false);
         }
@@ -113,67 +128,88 @@ public class MessServerListManager {
         }
         deviceCodeRetryTasks.clear();
 
-        for (ServerListAccount account : accounts) {
-            if (account.serverToken != null) {
-                try {
-                    dehostServer(account);
-                } catch (Exception e) {
-                    extension.logger().error(LOG_PREFIX + "Failed to dehost account " + account.displayLabel() + ": " + e.getMessage());
-                }
-            }
+        // An authentication/restoration flow may already be inside register or host.
+        // Give those a moment to leave the barrier, then dehost exclusively so
+        // nothing can advertise the server afterwards. Everything here is bounded:
+        // a tile that does not get dehosted expires on its own.
+        boolean dehosted = shutdownBarrier.afterQuiescence(this::dehostEverythingBriefly,
+                SHUTDOWN_QUIESCENCE_BUDGET_MILLIS, TimeUnit.MILLISECONDS);
+        if (!dehosted) {
+            extension.logger().debug(LOG_PREFIX + "Remote work was still in flight at shutdown; " +
+                    "the server list tiles will expire on their own.");
         }
         saveAllAccounts();
-        scheduler.shutdown();
+
+        scheduler.shutdownNow();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                scheduler.shutdownNow();
+                extension.logger().warning(LOG_PREFIX + "Some authentication tasks did not terminate within 5 seconds.");
             }
         } catch (InterruptedException e) {
             scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
     // ---- Auth Flow (per account) ----
 
     private void runAuthFlow(ServerListAccount account, int index) {
-        try {
-            restoreOrAuthenticate(account, index);
-        } catch (InterruptedException e) {
-            extension.logger().debug(LOG_PREFIX + e.getMessage());
-        } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Auth flow failed for account #" + (index + 1) + ": " + e.getMessage());
+        ShutdownBarrier.Lease lease = shutdownBarrier.tryEnter();
+        if (lease == null) {
+            return;
+        }
+        try (lease) {
+            try {
+                restoreOrAuthenticate(account, index);
+            } catch (InterruptedException e) {
+                extension.logger().debug(LOG_PREFIX + e.getMessage());
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                extension.logger().error(LOG_PREFIX + "Auth flow failed for account #" + (index + 1) + ": " + e.getMessage());
+            }
         }
     }
 
     /**
      * Completes the auth flow by registering/hosting the server.
-     * Throws on failure so callers can distinguish success from failure.
+     * Returns false when shutdown won the lifecycle race before completion.
+     * Throws on other failures so callers can distinguish them from shutdown.
      */
-    private void completeAuthFlow(ServerListAccount account, int index) throws Exception {
-        if (account.serverId != null && !account.serverId.isEmpty()) {
-            fetchServerToken(account);
-        } else {
-            registerNewServer(account);
-            extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
+    private boolean completeAuthFlow(ServerListAccount account, int index) throws Exception {
+        ShutdownBarrier.Lease lease = shutdownBarrier.tryEnter();
+        if (lease == null) {
+            return false;
         }
+        try (lease) {
+            if (account.serverId != null && !account.serverId.isEmpty()) {
+                fetchServerToken(account);
+            } else {
+                registerNewServer(account);
+                extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " registered with server ID: " + account.serverId);
+            }
 
-        tryEditTenantSettings(account);
-        hostServer(account);
-        tryEditServerInfo(account);
-        account.extractTenantId();
-        account.active = true;
-        saveAllAccounts();
+            if (shutdownBarrier.isShutdownRequested()) return false;
+            tryEditTenantSettings(account);
+            if (shutdownBarrier.isShutdownRequested()) return false;
+            hostServer(account);
+            if (shutdownBarrier.isShutdownRequested()) return false;
+            tryEditServerInfo(account);
+            account.extractTenantId();
+            account.active = true;
+            saveAllAccounts();
 
-        extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " hosted at " + globalServerIp +
-                " (" + account.displayLabel() + ")");
+            extension.logger().info(LOG_PREFIX + "Account #" + (index + 1) + " hosted at " + globalServerIp +
+                    " (" + account.displayLabel() + ")");
 
-        if (shutdownRequested) return;
-        scheduleServerUpdates(account);
-        scheduleTokenRefresh(account);
+            if (shutdownBarrier.isShutdownRequested()) return false;
+            scheduleServerUpdates(account);
+            scheduleTokenRefresh(account);
+            return true;
+        }
     }
 
     private void restoreOrAuthenticate(ServerListAccount account, int index) throws IOException, InterruptedException {
-        if (shutdownRequested) {
+        if (shutdownBarrier.isShutdownRequested()) {
             return;
         }
         boolean hasTooling = account.refreshToken != null && !account.refreshToken.isEmpty();
@@ -188,8 +224,7 @@ public class MessServerListManager {
             // 504s) keep both Global Admin sign ins and retry, since re-auth
             // here costs two device code flows.
             try {
-                ensureValidAccessToken(account);
-                ensureValidEduAccessToken(account);
+                ensureValidAuthenticationPair(account);
             } catch (Exception e) {
                 if (isLoginRejected(e)) {
                     extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
@@ -234,17 +269,20 @@ public class MessServerListManager {
      */
     private void startDeviceCodeFlows(ServerListAccount account, int index) {
         cancelDeviceCodeRetry(account);
-        if (shutdownRequested || !accounts.contains(account)) {
+        if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
             return;
         }
-        doDeviceCodeFlows(account, index).thenRun(() -> {
+        CompletableFuture<Void> authenticationFlow = trackAuthenticationFlow(doDeviceCodeFlows(account, index));
+        authenticationFlow.thenRun(() -> {
             // The sign ins can complete long after they were requested; the
             // account may have been removed or the server stopped since.
-            if (shutdownRequested || !accounts.contains(account)) {
+            if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
                 return;
             }
             try {
-                completeAuthFlow(account, index);
+                if (!completeAuthFlow(account, index)) {
+                    return;
+                }
             } catch (Exception e) {
                 // Signed in but hosting failed: infrastructure. The account
                 // holds fresh refresh tokens again, so the restore retry loop
@@ -256,6 +294,9 @@ public class MessServerListManager {
         }).exceptionally(ex -> {
             // The sign in never completed (typically an expired device code)
             // or the device code request itself failed. Prompt again.
+            if (shutdownBarrier.isShutdownRequested()) {
+                return null;
+            }
             extension.logger().error(LOG_PREFIX + "Auth failed for account #" + (index + 1) + ": " + ex.getMessage());
             scheduleDeviceCodeRetry(account, index);
             return null;
@@ -263,14 +304,14 @@ public class MessServerListManager {
     }
 
     private void scheduleDeviceCodeRetry(ServerListAccount account, int index) {
-        if (shutdownRequested || !accounts.contains(account)) {
+        if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
             return;
         }
         deviceCodeRetryTasks.computeIfAbsent(account, ignored -> scheduler.schedule(() -> {
             deviceCodeRetryTasks.remove(account);
             startDeviceCodeFlows(account, index);
         }, RESTORE_RETRY_INTERVAL_SECONDS, TimeUnit.SECONDS));
-        if (shutdownRequested || !accounts.contains(account)) {
+        if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
             cancelDeviceCodeRetry(account);
         }
     }
@@ -283,7 +324,7 @@ public class MessServerListManager {
     }
 
     private void scheduleRestoreRetry(ServerListAccount account, int index) {
-        if (shutdownRequested || !accounts.contains(account)) {
+        if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
             return;
         }
         restoreRetryTasks.computeIfAbsent(account, ignored -> scheduler.scheduleWithFixedDelay(
@@ -294,14 +335,13 @@ public class MessServerListManager {
     }
 
     private void retryRestore(ServerListAccount account, int index) {
-        if (shutdownRequested || !accounts.contains(account)) {
+        if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
             cancelRestoreRetry(account);
             return;
         }
         try {
             try {
-                ensureValidAccessToken(account);
-                ensureValidEduAccessToken(account);
+                ensureValidAuthenticationPair(account);
             } catch (Exception e) {
                 if (isLoginRejected(e)) {
                     extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
@@ -312,8 +352,9 @@ public class MessServerListManager {
                 }
                 throw e;
             }
-            completeAuthFlow(account, index);
-            cancelRestoreRetry(account);
+            if (completeAuthFlow(account, index)) {
+                cancelRestoreRetry(account);
+            }
         } catch (Exception e) {
             extension.logger().warning(LOG_PREFIX + "Server list restore retry failed for account #" + (index + 1) +
                     ": " + e.getMessage() + " (retrying in " + RESTORE_RETRY_INTERVAL_SECONDS + " seconds)");
@@ -327,20 +368,10 @@ public class MessServerListManager {
         }
     }
 
-    /**
-     * Whether an exception from the Entra token endpoint means the saved
-     * login itself is dead. Per Microsoft's token endpoint error reference,
-     * invalid_grant (an expired or revoked refresh token), interaction_required,
-     * and consent_required all demand a new interactive sign in; everything
-     * else (network failures, server_error, temporarily_unavailable) is
-     * retryable without touching the session. The endpoint's response body
-     * rides in the exception message.
-     */
+    /** Whether this account pair requires fresh interactive sign-ins. */
     private static boolean isLoginRejected(Exception e) {
-        String msg = e.getMessage();
-        return msg != null && (msg.contains("invalid_grant")
-                || msg.contains("interaction_required")
-                || msg.contains("consent_required"));
+        return e instanceof TenantValidationException
+                || EntraOAuthClient.requiresInteractiveLogin(e);
     }
 
     /**
@@ -368,6 +399,10 @@ public class MessServerListManager {
     // ---- Add Account (command-triggered) ----
 
     public void addAccount(CommandSource source) {
+        if (shutdownBarrier.isShutdownRequested()) {
+            source.sendMessage(LOG_PREFIX + "Server list registration is shutting down.");
+            return;
+        }
         if (!serverListEndpointAvailable) {
             source.sendMessage(LOG_PREFIX + "Server list registration is disabled until server-ip is set in serverlist_config.yml.");
             return;
@@ -379,14 +414,21 @@ public class MessServerListManager {
         source.sendMessage(LOG_PREFIX + "Starting device code flow for new account #" + (index + 1) + "...");
 
         scheduler.execute(() -> {
-            doDeviceCodeFlows(account, index).thenRun(() -> {
+            if (shutdownBarrier.isShutdownRequested()) {
+                accounts.remove(account);
+                return;
+            }
+            CompletableFuture<Void> authenticationFlow = trackAuthenticationFlow(doDeviceCodeFlows(account, index));
+            authenticationFlow.thenRun(() -> {
                 // Same guard as the unattended flow: the account may have
                 // been removed or the server stopped during the sign in.
-                if (shutdownRequested || !accounts.contains(account)) {
+                if (shutdownBarrier.isShutdownRequested() || !accounts.contains(account)) {
                     return;
                 }
                 try {
-                    completeAuthFlow(account, index);
+                    if (!completeAuthFlow(account, index)) {
+                        return;
+                    }
                     source.sendMessage(LOG_PREFIX + "Account #" + (index + 1) + " registered successfully!" +
                             " Tenant: " + account.displayLabel());
                 } catch (Exception e) {
@@ -395,6 +437,9 @@ public class MessServerListManager {
                     source.sendMessage(LOG_PREFIX + "Failed to host server: " + e.getMessage());
                 }
             }).exceptionally(ex -> {
+                if (shutdownBarrier.isShutdownRequested()) {
+                    return null;
+                }
                 extension.logger().error(LOG_PREFIX + "Failed to add account: " + ex.getMessage());
                 accounts.remove(account);
                 source.sendMessage(LOG_PREFIX + "Failed to add account: " + ex.getMessage());
@@ -450,127 +495,68 @@ public class MessServerListManager {
 
     // ---- Device Code OAuth ----
 
+    private <T> CompletableFuture<T> trackAuthenticationFlow(CompletableFuture<T> flow) {
+        authenticationFlows.add(flow);
+        flow.whenComplete((ignored, throwable) -> authenticationFlows.remove(flow));
+        if (shutdownBarrier.isShutdownRequested()) {
+            flow.cancel(false);
+        }
+        return flow;
+    }
+
     private CompletableFuture<Void> doDeviceCodeFlows(ServerListAccount account, int index) {
         extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + ": Two sign-ins required.");
-        return doDeviceCodeFlow(TOOLING_CLIENT_ID, "tooling authentication").thenCompose(toolingTokens -> {
-            account.accessToken = toolingTokens.get("access_token").getAsString();
-            account.refreshToken = toolingTokens.has("refresh_token")
-                    ? toolingTokens.get("refresh_token").getAsString() : null;
-            account.accessTokenExpires = parseTokenExpiry(toolingTokens);
+        return doDeviceCodeFlow(EntraOAuthClient.TOOLING_CLIENT_ID, "tooling authentication")
+                .thenCompose(toolingTokens -> {
+            account.accessToken = toolingTokens.accessToken();
+            account.refreshToken = toolingTokens.refreshToken();
+            account.accessTokenExpires = toolingTokens.accessTokenExpires();
             account.extractTokenClaims();
 
             extension.logger().debug(LOG_PREFIX + "Step 2/2: Sign in for server registration...");
-            return doDeviceCodeFlow(EDU_CLIENT_ID, "server authentication");
+            return doDeviceCodeFlow(EntraOAuthClient.EDUCATION_CLIENT_ID, "server authentication");
         }).thenAccept(eduTokens -> {
-            account.eduAccessToken = eduTokens.get("access_token").getAsString();
-            account.eduRefreshToken = eduTokens.has("refresh_token")
-                    ? eduTokens.get("refresh_token").getAsString() : null;
-            account.eduAccessTokenExpires = parseTokenExpiry(eduTokens);
+            String eduAccessToken = eduTokens.accessToken();
+            validateMatchingTenants(account.accessToken, eduAccessToken);
+            account.eduAccessToken = eduAccessToken;
+            account.eduRefreshToken = eduTokens.refreshToken();
+            account.eduAccessTokenExpires = eduTokens.accessTokenExpires();
             account.extractTokenClaims();
             extension.logger().debug(LOG_PREFIX + "Both authentications successful (" + account.displayLabel() + ")!");
         });
     }
 
-    private CompletableFuture<JsonObject> doDeviceCodeFlow(String clientId, String label) {
-        String deviceCodeBody = "client_id=" + URLEncoder.encode(clientId, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-        String pollBodyBase = "grant_type=" + URLEncoder.encode("urn:ietf:params:oauth:grant-type:device_code", StandardCharsets.UTF_8)
-                + "&client_id=" + URLEncoder.encode(clientId, StandardCharsets.UTF_8);
-
-        CompletableFuture<JsonObject> future = new CompletableFuture<>();
+    private CompletableFuture<EntraOAuthClient.Tokens> doDeviceCodeFlow(String clientId, String label) {
         try {
-            JsonObject response = postForm(ENTRA_BASE + "/devicecode", deviceCodeBody);
-
-            String deviceCode = response.get("device_code").getAsString();
-            String userCode = response.get("user_code").getAsString();
-            String verificationUri = response.has("verification_uri")
-                    ? response.get("verification_uri").getAsString()
-                    : response.get("verification_url").getAsString();
-            int expiresIn = response.get("expires_in").getAsInt();
-            int initialInterval = response.get("interval").getAsInt();
+            EntraOAuthClient.DeviceAuthorization authorization = oauthClient.requestDeviceCode(clientId);
 
             extension.logger().info(LOG_PREFIX + "============================================");
-            extension.logger().info(LOG_PREFIX + "  Go to: " + verificationUri);
-            extension.logger().info(LOG_PREFIX + "  Enter code: " + userCode);
+            extension.logger().info(LOG_PREFIX + "  Go to: " + authorization.verificationUri());
+            extension.logger().info(LOG_PREFIX + "  Enter code: " + authorization.userCode());
             extension.logger().info(LOG_PREFIX + "  (" + label + ")");
             extension.logger().info(LOG_PREFIX + "============================================");
             extension.logger().debug(LOG_PREFIX + "Waiting for sign-in...");
 
-            String pollBody = pollBodyBase + "&device_code=" + URLEncoder.encode(deviceCode, StandardCharsets.UTF_8);
-            long deadline = System.currentTimeMillis() + (expiresIn * 1000L);
-            AtomicInteger interval = new AtomicInteger(initialInterval);
-
-            schedulePollTick(future, pollBody, ENTRA_BASE + "/token", label, deadline, interval);
+            return oauthClient.poll(authorization).thenApply(tokens -> {
+                extension.logger().debug(LOG_PREFIX + "Authentication successful (" + label + ")!");
+                return tokens;
+            });
         } catch (IOException e) {
-            future.completeExceptionally(e);
+            return CompletableFuture.failedFuture(e);
         }
-        return future;
-    }
-
-    private void schedulePollTick(CompletableFuture<JsonObject> future, String pollBody,
-                                  String tokenUrl, String label, long deadline, AtomicInteger interval) {
-        scheduler.schedule(() -> {
-            if (future.isDone()) return;
-            if (shutdownRequested) {
-                future.completeExceptionally(new IOException("Device code flow interrupted by shutdown"));
-                return;
-            }
-            if (System.currentTimeMillis() >= deadline) {
-                future.completeExceptionally(new IOException("Device code expired"));
-                return;
-            }
-            try {
-                JsonObject response = postForm(tokenUrl, pollBody);
-                if (response.has("access_token")) {
-                    extension.logger().debug(LOG_PREFIX + "Authentication successful (" + label + ")!");
-                    future.complete(response);
-                    return;
-                }
-            } catch (IOException e) {
-                String msg = e.getMessage();
-                if (msg != null && msg.contains("authorization_pending")) {
-                    schedulePollTick(future, pollBody, tokenUrl, label, deadline, interval);
-                    return;
-                }
-                if (msg != null && msg.contains("slow_down")) {
-                    interval.addAndGet(5);
-                    schedulePollTick(future, pollBody, tokenUrl, label, deadline, interval);
-                    return;
-                }
-                if (msg != null && msg.contains("expired_token")) {
-                    future.completeExceptionally(new IOException("Device code expired before user completed sign-in"));
-                    return;
-                }
-                future.completeExceptionally(e);
-                return;
-            }
-            schedulePollTick(future, pollBody, tokenUrl, label, deadline, interval);
-        }, interval.get(), TimeUnit.SECONDS);
     }
 
     // ---- Token Refresh ----
 
-    /**
-     * Both refresh helpers throw with the token endpoint's response body in
-     * the message so callers can classify the failure via isLoginRejected;
-     * swallowing it into a boolean would erase the invalid_grant distinction.
-     */
     private void refreshAccessToken(ServerListAccount account) throws IOException {
         if (account.refreshToken == null) {
             throw new IOException("No tooling refresh token available");
         }
-        String body = "grant_type=refresh_token"
-                + "&client_id=" + URLEncoder.encode(TOOLING_CLIENT_ID, StandardCharsets.UTF_8)
-                + "&refresh_token=" + URLEncoder.encode(account.refreshToken, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-        JsonObject response = postForm(ENTRA_BASE + "/token", body);
-        if (!response.has("access_token")) {
-            throw new IOException("Tooling token refresh failed: no access_token in response");
-        }
-        account.accessToken = response.get("access_token").getAsString();
-        account.refreshToken = response.has("refresh_token")
-                ? response.get("refresh_token").getAsString() : account.refreshToken;
-        account.accessTokenExpires = parseTokenExpiry(response);
+        EntraOAuthClient.Tokens tokens = oauthClient.refresh(
+                EntraOAuthClient.TOOLING_CLIENT_ID, account.refreshToken);
+        account.accessToken = tokens.accessToken();
+        account.refreshToken = tokens.refreshToken();
+        account.accessTokenExpires = tokens.accessTokenExpires();
         account.extractTokenClaims();
         saveAllAccounts();
     }
@@ -579,18 +565,11 @@ public class MessServerListManager {
         if (account.eduRefreshToken == null) {
             throw new IOException("No edu refresh token available");
         }
-        String body = "grant_type=refresh_token"
-                + "&client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
-                + "&refresh_token=" + URLEncoder.encode(account.eduRefreshToken, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-        JsonObject response = postForm(ENTRA_BASE + "/token", body);
-        if (!response.has("access_token")) {
-            throw new IOException("Edu token refresh failed: no access_token in response");
-        }
-        account.eduAccessToken = response.get("access_token").getAsString();
-        account.eduRefreshToken = response.has("refresh_token")
-                ? response.get("refresh_token").getAsString() : account.eduRefreshToken;
-        account.eduAccessTokenExpires = parseTokenExpiry(response);
+        EntraOAuthClient.Tokens tokens = oauthClient.refresh(
+                EntraOAuthClient.EDUCATION_CLIENT_ID, account.eduRefreshToken);
+        account.eduAccessToken = tokens.accessToken();
+        account.eduRefreshToken = tokens.refreshToken();
+        account.eduAccessTokenExpires = tokens.accessTokenExpires();
         account.extractTokenClaims();
         saveAllAccounts();
     }
@@ -603,6 +582,33 @@ public class MessServerListManager {
     private void ensureValidEduAccessToken(ServerListAccount account) throws IOException {
         if (account.eduAccessTokenExpires > Instant.now().getEpochSecond() + TOKEN_EXPIRY_BUFFER_SECONDS) return;
         refreshEduAccessToken(account);
+    }
+
+    private void ensureValidAuthenticationPair(ServerListAccount account) throws IOException {
+        ensureValidAccessToken(account);
+        ensureValidEduAccessToken(account);
+        validateMatchingTenants(account.accessToken, account.eduAccessToken);
+    }
+
+    static void validateMatchingTenants(@Nullable String toolingAccessToken, @Nullable String eduAccessToken) {
+        String toolingTenantId = ServerListAccount.extractTenantIdFromToken(toolingAccessToken);
+        String eduTenantId = ServerListAccount.extractTenantIdFromToken(eduAccessToken);
+        if (toolingTenantId == null) {
+            throw new TenantValidationException("The tooling sign-in token does not contain a tenant ID.");
+        }
+        if (eduTenantId == null) {
+            throw new TenantValidationException("The server sign-in token does not contain a tenant ID.");
+        }
+        if (!toolingTenantId.equalsIgnoreCase(eduTenantId)) {
+            throw new TenantValidationException("The two sign-ins belong to different tenants (tooling: "
+                    + toolingTenantId + ", server: " + eduTenantId + "). Use accounts from the same tenant.");
+        }
+    }
+
+    private static final class TenantValidationException extends IllegalStateException {
+        private TenantValidationException(String message) {
+            super(message);
+        }
     }
 
     // ---- MESS Server Registration ----
@@ -708,8 +714,37 @@ public class MessServerListManager {
     }
 
     private void dehostServer(ServerListAccount account) throws IOException {
-        postEmptyWithAuth(MESS_BASE + "/server/dehost", account.serverToken);
+        dehostServer(account, HTTP_TIMEOUT);
+    }
+
+    private void dehostServer(ServerListAccount account, int timeoutMillis) throws IOException {
+        postEmptyWithAuth(MESS_BASE + "/server/dehost", account.serverToken, timeoutMillis);
         account.active = false;
+    }
+
+    /**
+     * Best-effort dehost of every hosted account within a fixed budget, for the
+     * shutdown path. Accounts left over when the budget runs out keep their
+     * registration; MESS stops listing them once their updates stop arriving.
+     */
+    private void dehostEverythingBriefly() {
+        long deadline = System.currentTimeMillis() + SHUTDOWN_DEHOST_BUDGET_MILLIS;
+        for (ServerListAccount account : accounts) {
+            if (account.serverToken == null) {
+                continue;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                extension.logger().debug(LOG_PREFIX + "Out of time dehosting at shutdown; " +
+                        "the remaining server list tiles will expire on their own.");
+                return;
+            }
+            try {
+                dehostServer(account, SHUTDOWN_HTTP_TIMEOUT_MILLIS);
+            } catch (Exception e) {
+                extension.logger().debug(LOG_PREFIX + "Could not dehost account " + account.displayLabel() +
+                        " at shutdown: " + e.getMessage());
+            }
+        }
     }
 
     private static final java.net.InetSocketAddress INTERNAL_ADDRESS = new java.net.InetSocketAddress("1.1.1.1", 0);
@@ -732,21 +767,27 @@ public class MessServerListManager {
     }
 
     private void sendServerUpdate(ServerListAccount account) {
-        try {
-            int playerCount = getPlayerCount();
-            long now = System.currentTimeMillis();
-            if (playerCount == account.lastSentPlayerCount
-                    && now - account.lastSuccessfulUpdateMillis < UPDATE_KEEPALIVE_MILLIS) {
-                return;
+        ShutdownBarrier.Lease lease = shutdownBarrier.tryEnter();
+        if (lease == null) {
+            return;
+        }
+        try (lease) {
+            try {
+                int playerCount = getPlayerCount();
+                long now = System.currentTimeMillis();
+                if (playerCount == account.lastSentPlayerCount
+                        && now - account.lastSuccessfulUpdateMillis < UPDATE_KEEPALIVE_MILLIS) {
+                    return;
+                }
+                String json = "{\"playerCount\":" + playerCount
+                        + ",\"maxPlayers\":" + globalMaxPlayers
+                        + ",\"health\":" + MESS_HEALTH_OPTIMAL + "}";
+                postJsonWithAuth(MESS_BASE + "/server/update", account.serverToken, json);
+                account.lastSentPlayerCount = playerCount;
+                account.lastSuccessfulUpdateMillis = now;
+            } catch (Exception e) {
+                extension.logger().error(LOG_PREFIX + "Server update failed: " + e.getMessage());
             }
-            String json = "{\"playerCount\":" + playerCount
-                    + ",\"maxPlayers\":" + globalMaxPlayers
-                    + ",\"health\":" + MESS_HEALTH_OPTIMAL + "}";
-            postJsonWithAuth(MESS_BASE + "/server/update", account.serverToken, json);
-            account.lastSentPlayerCount = playerCount;
-            account.lastSuccessfulUpdateMillis = now;
-        } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Server update failed: " + e.getMessage());
         }
     }
 
@@ -759,29 +800,34 @@ public class MessServerListManager {
 
     private void scheduleTokenRefresh(ServerListAccount account) {
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
-            if (shutdownRequested) return;
-            try {
+            ShutdownBarrier.Lease lease = shutdownBarrier.tryEnter();
+            if (lease == null) {
+                return;
+            }
+            try (lease) {
                 try {
-                    ensureValidAccessToken(account);
-                    ensureValidEduAccessToken(account);
-                } catch (Exception e) {
-                    if (isLoginRejected(e)) {
-                        int index = accounts.indexOf(account);
-                        extension.logger().warning(LOG_PREFIX + "The login for tenant " + account.displayLabel() +
-                                " was rejected, re-authenticating...");
-                        extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
-                        if (index >= 0) {
-                            reauthenticate(account, index);
+                    try {
+                        ensureValidAuthenticationPair(account);
+                    } catch (Exception e) {
+                        if (isLoginRejected(e)) {
+                            int index = accounts.indexOf(account);
+                            extension.logger().warning(LOG_PREFIX + "The login for tenant " + account.displayLabel() +
+                                    " was rejected, re-authenticating...");
+                            extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
+                            if (index >= 0) {
+                                reauthenticate(account, index);
+                            }
+                            return;
                         }
-                        return;
+                        throw e;
                     }
-                    throw e;
+                    if (shutdownBarrier.isShutdownRequested()) return;
+                    fetchServerToken(account);
+                    saveAllAccounts();
+                } catch (Exception e) {
+                    extension.logger().error(LOG_PREFIX + "Token refresh failed for account " + account.displayLabel() +
+                            ": " + e.getMessage() + " (retried on the next cycle)");
                 }
-                fetchServerToken(account);
-                saveAllAccounts();
-            } catch (Exception e) {
-                extension.logger().error(LOG_PREFIX + "Token refresh failed for account " + account.displayLabel() +
-                        ": " + e.getMessage() + " (retried on the next cycle)");
             }
         }, 30, 30, TimeUnit.MINUTES);
         accountTasks.computeIfAbsent(account, k -> new CopyOnWriteArrayList<>()).add(task);
@@ -843,7 +889,7 @@ public class MessServerListManager {
     }
 
     // Global config shared by all accounts
-    private String globalServerName = "";
+    private String globalServerName = DEFAULT_SERVER_NAME;
     private String globalServerIp = "";
     private int globalServerPort = -1;
     private int globalMaxPlayers = 40;
@@ -858,7 +904,7 @@ public class MessServerListManager {
                 Files.writeString(configPath,
                         "# EduGeyser Server List Configuration\n\n" +
                         "# Display name shown in the Education Edition server list.\n" +
-                        "server-name: \"\"\n\n" +
+                        "server-name: \"" + DEFAULT_SERVER_NAME + "\"\n\n" +
                         "# Public IP or hostname (e.g. \"mc.example.com\").\n" +
                         "# Leave empty to auto-detect.\n" +
                         "server-ip: \"\"\n\n" +
@@ -876,13 +922,22 @@ public class MessServerListManager {
             var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
                     .path(configPath).build();
             var node = loader.load();
-            globalServerName = node.node("server-name").getString("");
+            String configuredServerName = node.node("server-name").getString(DEFAULT_SERVER_NAME);
+            globalServerName = configuredServerName == null || configuredServerName.isBlank()
+                    ? DEFAULT_SERVER_NAME : configuredServerName;
             String configuredIp = node.node("server-ip").getString("");
             globalServerIp = configuredIp == null ? "" : configuredIp.trim();
             globalServerIpConfigured = !globalServerIp.isEmpty();
             String configuredPort = node.node("server-port").getString("");
             String portStr = configuredPort == null ? "" : configuredPort.trim();
-            globalServerPort = portStr.isEmpty() ? -1 : Integer.parseInt(portStr);
+            try {
+                globalServerPort = parseServerPort(portStr);
+            } catch (IllegalArgumentException e) {
+                serverListEndpointAvailable = false;
+                extension.logger().error(LOG_PREFIX + "Invalid server-port in " + CONFIG_FILE + ": " +
+                        e.getMessage() + " Server list registration is disabled until this value is fixed and the server restarted.");
+                return;
+            }
             globalServerPortConfigured = !portStr.isEmpty();
             globalMaxPlayers = node.node("max-players").getInt(40);
         } catch (Exception e) {
@@ -905,32 +960,51 @@ public class MessServerListManager {
 
         synchronized (configFileLock) {
             try {
-                var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
-                        .path(sessionPath).build();
-                var root = loader.load();
-                var accountsNode = root.node("accounts");
-                if (accountsNode.isList()) {
-                    for (var node : accountsNode.childrenList()) {
-                        ServerListAccount a = new ServerListAccount();
-                        a.serverId = node.node("server-id").getString();
-                        a.refreshToken = node.node("refresh-token").getString();
-                        a.accessToken = node.node("access-token").getString();
-                        a.accessTokenExpires = node.node("access-token-expires").getLong(0);
-                        a.eduRefreshToken = node.node("edu-refresh-token").getString();
-                        a.eduAccessToken = node.node("edu-access-token").getString();
-                        a.eduAccessTokenExpires = node.node("edu-access-token-expires").getLong(0);
-                        a.serverToken = node.node("server-token").getString();
-                        a.serverTokenJwt = node.node("server-token-jwt").getString();
-                        a.serverTokenExpires = node.node("server-token-expires").getLong(0);
-                        a.extractTenantId();
-                        a.extractTokenClaims();
-                        accounts.add(a);
-                    }
-                }
+                accounts.addAll(readAccounts(sessionPath, (entry, error) ->
+                        extension.logger().error(LOG_PREFIX + "Skipping malformed session account #" + entry
+                                + ": " + error.getMessage())));
             } catch (Exception e) {
                 extension.logger().error(LOG_PREFIX + "Failed to load sessions: " + e.getMessage());
             }
         }
+    }
+
+    static List<ServerListAccount> readAccounts(Path sessionPath,
+                                                 BiConsumer<Integer, Exception> malformedEntryHandler) throws IOException {
+        var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
+                .path(sessionPath).build();
+        var accountsNode = loader.load().node("accounts");
+        List<ServerListAccount> loadedAccounts = new ArrayList<>();
+        if (!accountsNode.isList()) {
+            return loadedAccounts;
+        }
+
+        int entry = 0;
+        for (var node : accountsNode.childrenList()) {
+            entry++;
+            try {
+                if (!node.isMap()) {
+                    throw new IllegalArgumentException("account entry must be a mapping");
+                }
+                ServerListAccount account = new ServerListAccount();
+                account.serverId = node.node("server-id").getString();
+                account.refreshToken = node.node("refresh-token").getString();
+                account.accessToken = node.node("access-token").getString();
+                account.accessTokenExpires = node.node("access-token-expires").getLong(0);
+                account.eduRefreshToken = node.node("edu-refresh-token").getString();
+                account.eduAccessToken = node.node("edu-access-token").getString();
+                account.eduAccessTokenExpires = node.node("edu-access-token-expires").getLong(0);
+                account.serverToken = node.node("server-token").getString();
+                account.serverTokenJwt = node.node("server-token-jwt").getString();
+                account.serverTokenExpires = node.node("server-token-expires").getLong(0);
+                account.extractTenantId();
+                account.extractTokenClaims();
+                loadedAccounts.add(account);
+            } catch (Exception e) {
+                malformedEntryHandler.accept(entry, e);
+            }
+        }
+        return loadedAccounts;
     }
 
     private boolean resolveServerListEndpoint() {
@@ -979,7 +1053,7 @@ public class MessServerListManager {
                     sb.append("    server-token-jwt: ").append(yamlStr(a.serverTokenJwt)).append("\n");
                     sb.append("    server-token-expires: ").append(a.serverTokenExpires).append("\n");
                 }
-                Files.writeString(path, sb.toString());
+                AtomicFileWriter.writeString(path, sb.toString());
             } catch (Exception e) {
                 extension.logger().error(LOG_PREFIX + "Failed to save sessions: " + e.getMessage());
             }
@@ -1000,12 +1074,34 @@ public class MessServerListManager {
         saveAllAccounts();
     }
 
-    private static String formatIpPort(String ip, int port) {
-        if (ip.contains(":")) {
-            // IPv6: wrap in brackets
-            return "[" + ip + "]:" + port;
+    static String formatIpPort(String ip, int port) {
+        String host = ip;
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
         }
-        return ip + ":" + port;
+        if (host.contains(":")) {
+            // IPv6 requires exactly one bracket pair when followed by a port.
+            return "[" + host + "]:" + port;
+        }
+        return host + ":" + port;
+    }
+
+    static int parseServerPort(@Nullable String configuredPort) {
+        String value = configuredPort == null ? "" : configuredPort.trim();
+        if (value.isEmpty()) {
+            return -1;
+        }
+
+        final int port;
+        try {
+            port = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("expected a whole number from 1 through 65535, but got \"" + value + "\"", e);
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("expected a value from 1 through 65535, but got " + port);
+        }
+        return port;
     }
 
     private static String esc(String v) {
@@ -1057,33 +1153,6 @@ public class MessServerListManager {
 
     // ---- HTTP Helpers ----
 
-    private JsonObject postForm(String url, String formBody) throws IOException {
-        HttpURLConnection con = (HttpURLConnection) URI.create(url).toURL().openConnection();
-        try {
-            con.setRequestMethod("POST");
-            con.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            con.setConnectTimeout(HTTP_TIMEOUT);
-            con.setReadTimeout(HTTP_TIMEOUT);
-            con.setDoOutput(true);
-            try (OutputStream os = con.getOutputStream()) {
-                os.write(formBody.getBytes(StandardCharsets.UTF_8));
-            }
-            int code = con.getResponseCode();
-            if (code >= 400) {
-                String err = readStream(con.getErrorStream());
-                if (err.contains("authorization_pending")) {
-                    throw new IOException("authorization_pending");
-                }
-                throw new IOException("HTTP " + code + ": " + err);
-            }
-            try (InputStreamReader isr = new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8)) {
-                return JsonParser.parseReader(isr).getAsJsonObject();
-            }
-        } finally {
-            con.disconnect();
-        }
-    }
-
     private String getWithAuth(String url, String bearerToken) throws IOException {
         HttpURLConnection con = (HttpURLConnection) URI.create(url).toURL().openConnection();
         try {
@@ -1128,13 +1197,17 @@ public class MessServerListManager {
     }
 
     private String postEmptyWithAuth(String url, String bearerToken) throws IOException {
+        return postEmptyWithAuth(url, bearerToken, HTTP_TIMEOUT);
+    }
+
+    private String postEmptyWithAuth(String url, String bearerToken, int timeoutMillis) throws IOException {
         HttpURLConnection con = (HttpURLConnection) URI.create(url).toURL().openConnection();
         try {
             con.setRequestMethod("POST");
             con.setRequestProperty("Authorization", "Bearer " + bearerToken);
             con.setRequestProperty("x-request-id", UUID.randomUUID().toString());
-            con.setConnectTimeout(HTTP_TIMEOUT);
-            con.setReadTimeout(HTTP_TIMEOUT);
+            con.setConnectTimeout(timeoutMillis);
+            con.setReadTimeout(timeoutMillis);
             con.setDoOutput(true);
             try (OutputStream os = con.getOutputStream()) {
                 os.write(new byte[0]);
@@ -1157,10 +1230,4 @@ public class MessServerListManager {
         }
     }
 
-    private long parseTokenExpiry(JsonObject response) {
-        if (response.has("expires_on")) return response.get("expires_on").getAsLong();
-        if (response.has("expires_in")) return Instant.now().getEpochSecond() + response.get("expires_in").getAsLong();
-        extension.logger().warning(LOG_PREFIX + "Token response missing expires_on and expires_in. Assuming 1 hour expiry.");
-        return Instant.now().getEpochSecond() + 3600;
-    }
 }
