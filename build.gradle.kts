@@ -21,7 +21,15 @@ repositories {
 dependencies {
     compileOnly("com.github.SendableMetatype.EduGeyser:api:49511769")
     compileOnly("com.github.SendableMetatype.EduGeyser:core:49511769")
-    implementation("org.spongepowered:configurate-yaml:4.1.2")
+    implementation("org.spongepowered:configurate-yaml:4.2.0")
+
+    testImplementation(libs.junit)
+    testImplementation(libs.gson.runtime)
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.0")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 tasks.jar {
