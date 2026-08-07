@@ -98,6 +98,15 @@ class MessServerListManagerTest {
     }
 
     @Test
+    void reportedPlayerCountStaysBelowTheMaximum() {
+        assertEquals(0, MessServerListManager.reportedPlayerCount(0, 40));
+        assertEquals(12, MessServerListManager.reportedPlayerCount(12, 40));
+        assertEquals(39, MessServerListManager.reportedPlayerCount(40, 40));
+        assertEquals(39, MessServerListManager.reportedPlayerCount(250, 40));
+        assertEquals(0, MessServerListManager.reportedPlayerCount(5, 1));
+    }
+
+    @Test
     void formatsRawAndBracketedIpv6WithOneBracketPair() {
         assertEquals("[2001:db8::1]:19132",
                 MessServerListManager.formatIpPort("2001:db8::1", 19132));

@@ -87,6 +87,8 @@ max-players: 40
 
 > **Always set `server-ip` and `server-port` explicitly.** Automatic detection is best effort and will cause issues behind NAT, tunnels, and reverse proxies, or when the external port differs from Geyser's bind port.
 
+The player count shown on the server list tile is capped just below `max-players` so the server always stays joinable. Configure and enforce real player limits in the backend server software.
+
 2. Restart the server
 3. Run `/edu serverlist add` from the console
 4. Two device code prompts appear, sign in with a Global Admin M365 Education account

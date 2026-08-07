@@ -773,7 +773,7 @@ public class MessServerListManager {
         }
         try (lease) {
             try {
-                int playerCount = getPlayerCount();
+                int playerCount = reportedPlayerCount(getPlayerCount(), globalMaxPlayers);
                 long now = System.currentTimeMillis();
                 if (playerCount == account.lastSentPlayerCount
                         && now - account.lastSuccessfulUpdateMillis < UPDATE_KEEPALIVE_MILLIS) {
@@ -792,6 +792,19 @@ public class MessServerListManager {
     }
 
     // ---- Scheduling (per account) ----
+
+    /**
+     * The player count reported to MESS. Unlike join codes the server list
+     * actually displays count and max, so the maximum cannot be hardcoded
+     * away, but capacity enforcement still belongs to the backend server.
+     * The report is therefore clamped to at least one below the maximum, so
+     * the tile always stays joinable and the API never sees a count above
+     * the max it would reject. The loader guarantees a maximum of at least
+     * one, so the result is never negative.
+     */
+    static int reportedPlayerCount(int actualCount, int maxPlayers) {
+        return Math.min(actualCount, maxPlayers - 1);
+    }
 
     private void scheduleServerUpdates(ServerListAccount account) {
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> sendServerUpdate(account), 10, 10, TimeUnit.SECONDS);
@@ -911,7 +924,9 @@ public class MessServerListManager {
                         "# Port players connect with. Leave empty to use Geyser's port.\n" +
                         "# Only set this if the external port differs from Geyser's (e.g. when using playit.gg).\n" +
                         "server-port: \"\"\n\n" +
-                        "# Maximum players shown in the server list.\n" +
+                        "# Maximum players shown in the server list. The shown player count is\n" +
+                        "# capped just below this so the server always stays joinable; enforce\n" +
+                        "# real player limits in the backend server software.\n" +
                         "max-players: 40\n");
             } catch (IOException e) {
                 extension.logger().error(LOG_PREFIX + "Failed to create config: " + e.getMessage());
@@ -939,7 +954,13 @@ public class MessServerListManager {
                 return;
             }
             globalServerPortConfigured = !portStr.isEmpty();
-            globalMaxPlayers = node.node("max-players").getInt(40);
+            int configuredMaxPlayers = node.node("max-players").getInt(40);
+            if (configuredMaxPlayers < 1) {
+                extension.logger().warning(LOG_PREFIX + "max-players must be at least 1; using 1 instead of "
+                        + configuredMaxPlayers + ".");
+                configuredMaxPlayers = 1;
+            }
+            globalMaxPlayers = configuredMaxPlayers;
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
         }
