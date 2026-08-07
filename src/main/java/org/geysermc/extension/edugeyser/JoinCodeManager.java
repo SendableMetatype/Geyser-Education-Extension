@@ -1,19 +1,14 @@
 package org.geysermc.extension.edugeyser;
 
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.geysermc.geyser.api.command.CommandSource;
 import org.geysermc.geyser.api.network.NethernetManager;
 
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -23,7 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 /**
  * Manages Education Edition join codes (multi-account).
@@ -35,13 +30,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class JoinCodeManager {
 
-    private static final String EDU_CLIENT_ID = "b36b1432-1a1c-4c82-9b76-24de1cab42f2";
-    private static final String SCOPE = "16556bfc-5102-43c9-a82a-3ea5e4810689/.default offline_access";
-    private static final String ENTRA_BASE = "https://login.microsoftonline.com/organizations/oauth2/v2.0";
     private static final String SESSION_FILE = "sessions_joincode.yml";
     private static final String CONFIG_FILE = "joincode_config.yml";
     private static final String LOG_PREFIX = "[JoinCode] ";
-    private static final int HTTP_TIMEOUT = 15000;
     private static final long HEARTBEAT_INTERVAL_SECONDS = 100;
     private static final long RESTORE_RETRY_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_SECONDS;
     private static final long ACCESS_TOKEN_REFRESH_MARGIN_SECONDS = 60;
@@ -49,6 +40,7 @@ public class JoinCodeManager {
 
     private final EduGeyserExtension extension;
     private final ScheduledExecutorService scheduler;
+    private final EntraOAuthClient oauthClient;
     private final Object fileLock = new Object();
     private final List<JoinCodeAccount> accounts = new CopyOnWriteArrayList<>();
     private final Map<JoinCodeAccount, List<ScheduledFuture<?>>> accountTasks = new ConcurrentHashMap<>();
@@ -58,13 +50,13 @@ public class JoinCodeManager {
     private volatile boolean shutdownRequested;
 
     // Global config shared by all accounts
-    private String worldName = "Education Server";
-    private String hostName = "EduGeyser";
-    private int maxPlayers = 40;
+    private String worldName = "World Name";
+    private String hostName = "Server Name";
 
     public JoinCodeManager(EduGeyserExtension extension) {
         this.extension = extension;
         this.scheduler = Executors.newScheduledThreadPool(4);
+        this.oauthClient = new EntraOAuthClient(scheduler, () -> shutdownRequested);
     }
 
     // ---- Lifecycle ----
@@ -159,7 +151,7 @@ public class JoinCodeManager {
             try {
                 refreshAccessToken(account);
             } catch (Exception e) {
-                if (isLoginRejected(e)) {
+                if (EntraOAuthClient.requiresInteractiveLogin(e)) {
                     extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
                             " was rejected, re-authenticating...");
                     extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
@@ -281,7 +273,12 @@ public class JoinCodeManager {
                         account.displayLabel());
                 return;
             }
-            // The saved registration has expired. Fall through and host a new code.
+            // Any non-OK result during startup falls through to hosting a new
+            // code intentionally. Although a timeout or 5xx may only be
+            // transient, treating startup as a recovery boundary gives an
+            // operator a way to escape an indefinitely unrestorable saved
+            // registration by restarting the server. The tradeoff is that a
+            // transient failure here can rotate an otherwise valid join code.
             extension.logger().debug(LOG_PREFIX + "Saved join code no longer active; hosting a new one for tenant " +
                     account.displayLabel());
         } else if (account.serverToken != null && account.passcode != null) {
@@ -294,7 +291,7 @@ public class JoinCodeManager {
                     " (the old code and share link no longer work)");
         }
 
-        String code = account.discoveryClient.host(parts.envelope(), worldName, hostName, maxPlayers);
+        String code = account.discoveryClient.host(parts.envelope(), worldName, hostName);
         if (code == null) {
             throw new IOException("Failed to register with Discovery API");
         }
@@ -336,7 +333,7 @@ public class JoinCodeManager {
                 try {
                     refreshAccessToken(account);
                 } catch (Exception e) {
-                    if (isLoginRejected(e)) {
+                    if (EntraOAuthClient.requiresInteractiveLogin(e)) {
                         extension.logger().warning(LOG_PREFIX + "The login for account #" + (index + 1) +
                                 " was rejected, re-authenticating...");
                         extension.logger().debug(LOG_PREFIX + "Rejection detail: " + e.getMessage());
@@ -360,23 +357,6 @@ public class JoinCodeManager {
         if (task != null) {
             task.cancel(false);
         }
-    }
-
-    /**
-     * Whether an exception from the Entra token endpoint means the saved
-     * login itself is dead. Per Microsoft's token endpoint error reference,
-     * invalid_grant (an expired or revoked refresh token), interaction_required,
-     * and consent_required all demand a new interactive sign in; everything
-     * else (network failures, server_error, temporarily_unavailable) is
-     * retryable without touching the session. The endpoint's response body
-     * rides in the exception message, the same mechanism the device code
-     * poller uses for authorization_pending and slow_down.
-     */
-    private static boolean isLoginRejected(Exception e) {
-        String msg = e.getMessage();
-        return msg != null && (msg.contains("invalid_grant")
-                || msg.contains("interaction_required")
-                || msg.contains("consent_required"));
     }
 
     /**
@@ -461,8 +441,19 @@ public class JoinCodeManager {
         cancelDeviceCodeRetry(account);
         cancelAccountTasks(account);
 
-        // No dehost. With its heartbeat task cancelled above, the code stops being
-        // beaten and ages out on its own within the server's window.
+        // Best-effort immediate revocation. If dehosting fails, the cancelled
+        // heartbeat still lets Discovery expire the code naturally.
+        scheduler.execute(() -> {
+            DiscoveryClient client = account.discoveryClient;
+            if (client == null && account.serverToken != null && account.passcode != null) {
+                client = new DiscoveryClient(extension.logger(), "");
+                client.setServerToken(account.serverToken);
+                client.setPasscode(account.passcode);
+            }
+            if (client != null) {
+                client.dehost();
+            }
+        });
 
         String oldCode = account.humanReadableCode;
         accounts.remove(account);
@@ -606,7 +597,7 @@ public class JoinCodeManager {
             try {
                 refreshAccessToken(account);
             } catch (Exception e) {
-                if (isLoginRejected(e)) {
+                if (EntraOAuthClient.requiresInteractiveLogin(e)) {
                     int index = accounts.indexOf(account);
                     extension.logger().warning(LOG_PREFIX + "The login for tenant " + account.displayLabel() +
                             " was rejected, re-authenticating...");
@@ -620,7 +611,7 @@ public class JoinCodeManager {
             }
             NetworkIdParts parts = requireNetworkIdParts();
             DiscoveryClient client = new DiscoveryClient(extension.logger(), account.accessToken);
-            String code = client.host(parts.envelope(), worldName, hostName, maxPlayers);
+            String code = client.host(parts.envelope(), worldName, hostName);
             if (code == null) {
                 throw new IOException("Failed to register with Discovery API");
             }
@@ -662,81 +653,23 @@ public class JoinCodeManager {
     // ---- Device Code OAuth (per account) ----
 
     private CompletableFuture<Void> doDeviceCodeFlow(JoinCodeAccount account, int index) throws IOException {
-        String deviceCodeBody = "client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-
-        JsonObject response = postForm(ENTRA_BASE + "/devicecode", deviceCodeBody);
-
-        String deviceCode = response.get("device_code").getAsString();
-        String userCode = response.get("user_code").getAsString();
-        String verificationUri = response.has("verification_uri")
-                ? response.get("verification_uri").getAsString()
-                : response.get("verification_url").getAsString();
-        int expiresIn = response.get("expires_in").getAsInt();
-        int initialInterval = response.get("interval").getAsInt();
+        EntraOAuthClient.DeviceAuthorization authorization =
+                oauthClient.requestDeviceCode(EntraOAuthClient.EDUCATION_CLIENT_ID);
 
         extension.logger().info(LOG_PREFIX + "============================================");
         extension.logger().info(LOG_PREFIX + "  Account #" + (index + 1) + ": Sign in with an education account");
-        extension.logger().info(LOG_PREFIX + "  Go to: " + verificationUri);
-        extension.logger().info(LOG_PREFIX + "  Enter code: " + userCode);
+        extension.logger().info(LOG_PREFIX + "  Go to: " + authorization.verificationUri());
+        extension.logger().info(LOG_PREFIX + "  Enter code: " + authorization.userCode());
         extension.logger().info(LOG_PREFIX + "============================================");
 
-        String pollBody = "grant_type=" + URLEncoder.encode("urn:ietf:params:oauth:grant-type:device_code", StandardCharsets.UTF_8)
-                + "&client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
-                + "&device_code=" + URLEncoder.encode(deviceCode, StandardCharsets.UTF_8);
-
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        long deadline = System.currentTimeMillis() + (expiresIn * 1000L);
-        AtomicInteger interval = new AtomicInteger(initialInterval);
-
-        schedulePollTick(future, account, index, pollBody, deadline, interval);
-        return future;
-    }
-
-    private void schedulePollTick(CompletableFuture<Void> future, JoinCodeAccount account, int index,
-                                  String pollBody, long deadline, AtomicInteger interval) {
-        scheduler.schedule(() -> {
-            if (future.isDone()) return;
-            if (shutdownRequested) {
-                future.completeExceptionally(new IOException("Interrupted by shutdown"));
-                return;
-            }
-            if (System.currentTimeMillis() >= deadline) {
-                future.completeExceptionally(new IOException("Device code expired"));
-                return;
-            }
-            try {
-                JsonObject response = postForm(ENTRA_BASE + "/token", pollBody);
-                if (response.has("access_token")) {
-                    account.accessToken = response.get("access_token").getAsString();
-                    account.refreshToken = response.has("refresh_token")
-                            ? response.get("refresh_token").getAsString() : null;
-                    account.accessTokenExpires = parseTokenExpiry(response);
-                    account.extractTokenClaims();
-                    extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1) + " authenticated as " + account.displayLabel());
-                    future.complete(null);
-                    return;
-                }
-            } catch (IOException e) {
-                String msg = e.getMessage();
-                if (msg != null && msg.contains("authorization_pending")) {
-                    schedulePollTick(future, account, index, pollBody, deadline, interval);
-                    return;
-                }
-                if (msg != null && msg.contains("slow_down")) {
-                    interval.addAndGet(5);
-                    schedulePollTick(future, account, index, pollBody, deadline, interval);
-                    return;
-                }
-                if (msg != null && msg.contains("expired_token")) {
-                    future.completeExceptionally(new IOException("Device code expired before sign-in"));
-                    return;
-                }
-                future.completeExceptionally(e);
-                return;
-            }
-            schedulePollTick(future, account, index, pollBody, deadline, interval);
-        }, interval.get(), TimeUnit.SECONDS);
+        return oauthClient.poll(authorization).thenAccept(tokens -> {
+            account.accessToken = tokens.accessToken();
+            account.refreshToken = tokens.refreshToken();
+            account.accessTokenExpires = tokens.accessTokenExpires();
+            account.extractTokenClaims();
+            extension.logger().debug(LOG_PREFIX + "Account #" + (index + 1)
+                    + " authenticated as " + account.displayLabel());
+        });
     }
 
     // ---- Token Refresh (per account) ----
@@ -745,20 +678,11 @@ public class JoinCodeManager {
         if (account.refreshToken == null) {
             throw new IOException("No refresh token available");
         }
-        String body = "grant_type=refresh_token"
-                + "&client_id=" + URLEncoder.encode(EDU_CLIENT_ID, StandardCharsets.UTF_8)
-                + "&refresh_token=" + URLEncoder.encode(account.refreshToken, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode(SCOPE, StandardCharsets.UTF_8);
-
-        JsonObject response = postForm(ENTRA_BASE + "/token", body);
-        if (!response.has("access_token")) {
-            throw new IOException("Token refresh failed: no access_token in response");
-        }
-
-        account.accessToken = response.get("access_token").getAsString();
-        account.refreshToken = response.has("refresh_token")
-                ? response.get("refresh_token").getAsString() : account.refreshToken;
-        account.accessTokenExpires = parseTokenExpiry(response);
+        EntraOAuthClient.Tokens tokens = oauthClient.refresh(
+                EntraOAuthClient.EDUCATION_CLIENT_ID, account.refreshToken);
+        account.accessToken = tokens.accessToken();
+        account.refreshToken = tokens.refreshToken();
+        account.accessTokenExpires = tokens.accessTokenExpires();
         account.extractTokenClaims();
         saveAllAccounts();
     }
@@ -842,11 +766,9 @@ public class JoinCodeManager {
                 Files.writeString(configPath,
                         "# EduGeyser Join Code Configuration\n\n" +
                         "# World name shown to joining clients.\n" +
-                        "world-name: \"Education Server\"\n\n" +
+                        "world-name: \"World Name\"\n\n" +
                         "# Host name shown to joining clients.\n" +
-                        "host-name: \"EduGeyser\"\n\n" +
-                        "# Maximum players shown.\n" +
-                        "max-players: 40\n");
+                        "host-name: \"Server Name\"\n");
             } catch (IOException e) {
                 extension.logger().error(LOG_PREFIX + "Failed to create config: " + e.getMessage());
                 return false;
@@ -857,9 +779,11 @@ public class JoinCodeManager {
             var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
                     .path(configPath).build();
             var node = loader.load();
-            worldName = node.node("world-name").getString("Education Server");
-            hostName = node.node("host-name").getString("EduGeyser");
-            maxPlayers = node.node("max-players").getInt(40);
+            worldName = node.node("world-name").getString("World Name");
+            hostName = node.node("host-name").getString("Server Name");
+            // Older configs may still contain max-players. Configurate ignores
+            // unknown keys, so it remains harmless while Discovery always gets
+            // the internal non-enforcing value defined by DiscoveryClient.
             return true;
         } catch (Exception e) {
             extension.logger().error(LOG_PREFIX + "Failed to load config: " + e.getMessage());
@@ -872,32 +796,51 @@ public class JoinCodeManager {
         if (!Files.exists(sessionPath)) return;
         synchronized (fileLock) {
             try {
-                var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
-                        .path(sessionPath).build();
-                var root = loader.load();
-                var accountsNode = root.node("accounts");
-                if (accountsNode.isList()) {
-                    for (var node : accountsNode.childrenList()) {
-                        JoinCodeAccount a = new JoinCodeAccount();
-                        a.refreshToken = node.node("refresh-token").getString();
-                        a.accessToken = node.node("access-token").getString();
-                        a.accessTokenExpires = node.node("access-token-expires").getLong(0);
-                        a.passcode = node.node("passcode").getString();
-                        a.serverToken = node.node("server-token").getString();
-                        a.connectionId = node.node("connection-id").getString();
-                        a.pmid = node.node("pmid").getString();
-                        a.extractTenantId();
-                        a.extractTokenClaims();
-                        if (a.passcode != null) {
-                            a.humanReadableCode = DiscoveryClient.parseJoinCode(a.passcode);
-                        }
-                        accounts.add(a);
-                    }
-                }
+                accounts.addAll(readAccounts(sessionPath, (entry, error) ->
+                        extension.logger().error(LOG_PREFIX + "Skipping malformed session account #" + entry +
+                                ": " + error.getMessage())));
             } catch (Exception e) {
                 extension.logger().error(LOG_PREFIX + "Failed to load sessions: " + e.getMessage());
             }
         }
+    }
+
+    static List<JoinCodeAccount> readAccounts(Path sessionPath,
+                                               BiConsumer<Integer, Exception> malformedEntryHandler) throws IOException {
+        var loader = org.spongepowered.configurate.yaml.YamlConfigurationLoader.builder()
+                .path(sessionPath).build();
+        var accountsNode = loader.load().node("accounts");
+        List<JoinCodeAccount> loadedAccounts = new ArrayList<>();
+        if (!accountsNode.isList()) {
+            return loadedAccounts;
+        }
+
+        int entry = 0;
+        for (var node : accountsNode.childrenList()) {
+            entry++;
+            try {
+                if (!node.isMap()) {
+                    throw new IllegalArgumentException("account entry must be a mapping");
+                }
+                JoinCodeAccount account = new JoinCodeAccount();
+                account.refreshToken = node.node("refresh-token").getString();
+                account.accessToken = node.node("access-token").getString();
+                account.accessTokenExpires = node.node("access-token-expires").getLong(0);
+                account.passcode = node.node("passcode").getString();
+                account.serverToken = node.node("server-token").getString();
+                account.connectionId = node.node("connection-id").getString();
+                account.pmid = node.node("pmid").getString();
+                account.extractTenantId();
+                account.extractTokenClaims();
+                if (account.passcode != null) {
+                    account.humanReadableCode = DiscoveryClient.parseJoinCode(account.passcode);
+                }
+                loadedAccounts.add(account);
+            } catch (Exception e) {
+                malformedEntryHandler.accept(entry, e);
+            }
+        }
+        return loadedAccounts;
     }
 
     private void saveAllAccounts() {
@@ -917,7 +860,7 @@ public class JoinCodeManager {
                     sb.append("    connection-id: ").append(yamlStr(a.connectionId)).append("\n");
                     sb.append("    pmid: ").append(yamlStr(a.pmid)).append("\n");
                 }
-                Files.writeString(path, sb.toString());
+                AtomicFileWriter.writeString(path, sb.toString());
             } catch (Exception e) {
                 extension.logger().error(LOG_PREFIX + "Failed to save sessions: " + e.getMessage());
             }
@@ -936,52 +879,6 @@ public class JoinCodeManager {
         account.rehosting = false;
         account.active = false;
         saveAllAccounts();
-    }
-
-    // ---- HTTP Helpers ----
-
-    private JsonObject postForm(String url, String formBody) throws IOException {
-        HttpURLConnection con = (HttpURLConnection) URI.create(url).toURL().openConnection();
-        try {
-            con.setRequestMethod("POST");
-            con.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            con.setConnectTimeout(HTTP_TIMEOUT);
-            con.setReadTimeout(HTTP_TIMEOUT);
-            con.setDoOutput(true);
-
-            try (OutputStream os = con.getOutputStream()) {
-                os.write(formBody.getBytes(StandardCharsets.UTF_8));
-            }
-
-            int code = con.getResponseCode();
-            if (code >= 400) {
-                String err = readStream(con.getErrorStream());
-                throw new IOException("HTTP " + code + ": " + err);
-            }
-
-            try (var isr = new java.io.InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8)) {
-                return JsonParser.parseReader(isr).getAsJsonObject();
-            }
-        } finally {
-            con.disconnect();
-        }
-    }
-
-    private String readStream(java.io.@Nullable InputStream stream) throws IOException {
-        if (stream == null) return "";
-        try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) sb.append(line);
-            return sb.toString();
-        }
-    }
-
-    private static long parseTokenExpiry(JsonObject tokenResponse) {
-        if (tokenResponse.has("expires_in")) {
-            return System.currentTimeMillis() / 1000 + tokenResponse.get("expires_in").getAsLong();
-        }
-        return 0;
     }
 
     private static String esc(String v) {

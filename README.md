@@ -48,10 +48,11 @@ Run `/edu joincode add` once per tenant. Each requires a separate education acco
 Edit `extensions/edu/joincode_config.yml` inside the Geyser folder:
 
 ```yaml
-world-name: "Education Server"
-host-name: "EduGeyser"
-max-players: 40
+world-name: "World Name"
+host-name: "Server Name"
 ```
+
+Configure and enforce player limits in the backend server software. Join-code Discovery registration does not provide an authoritative player cap.
 
 ### Commands
 
@@ -125,7 +126,7 @@ All paths are relative to the Geyser folder, which depends on your platform: `pl
 | File | Purpose |
 |------|---------|
 | `nethernet/connection-id.yml` | The connection ID and signaling account identity, owned by EduGeyser |
-| `extensions/edu/joincode_config.yml` | World name, host name, and max players for join codes |
+| `extensions/edu/joincode_config.yml` | World and host names shown for join codes |
 | `extensions/edu/sessions_joincode.yml` | Join code OAuth tokens (managed automatically) |
 | `extensions/edu/serverlist_config.yml` | Server list name, IP, port, max players |
 | `extensions/edu/sessions_serverlist.yml` | Server list OAuth tokens (managed automatically) |
