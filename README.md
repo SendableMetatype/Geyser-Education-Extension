@@ -3,10 +3,10 @@
 > [!IMPORTANT]
 > If you are an end user of EduGeyser and looking to set it up, this repo has nothing of value to you. Get EduGeyser from the [download page](https://edugeyser.org/download) instead, and follow the [setup guide](https://edugeyser.org/wiki/geyser/education/setup) on the website.
 
-This is the source code of the education extension that ships bundled inside [EduGeyser](https://edugeyser.org/). It installs itself automatically on startup; there is nothing to download and nothing to place in the extensions folder. It handles how Minecraft Education Edition students connect to a server:
+This is the source code of the education extension that ships bundled inside [EduGeyser](https://edugeyser.org/). It installs itself automatically on startup; there is nothing to download and nothing to place in the extensions folder. It handles how Minecraft Education Edition players connect to a server:
 
-1. **Connection ID**: a stable ID that students enter in Education Edition's connection dialog. Works across all tenants, no accounts needed.
-2. **Join Codes**: codes that students enter on Education Edition's join code screen, or open through a share link. Each code is tied to one M365 Education tenant.
+1. **Connection ID**: a stable ID that players enter in Education Edition's connection dialog. Works across all tenants, no accounts needed.
+2. **Join Codes**: codes that players enter on Education Edition's join code screen, or open through a share link. Each code is tied to one M365 Education tenant.
 3. **Server List**: broadcasts the server to Education Edition's own server browser. Requires Global Admin access to an M365 Education tenant.
 4. **Tenant Whitelist**: optionally restricts which organizations may join.
 
@@ -22,18 +22,18 @@ The connection ID is generated and owned by EduGeyser itself, not by this extens
 
 The ID is a number stored in the file followed by an account identifier that EduGeyser stores alongside it, so the full value is stable across restarts. Generated numbers are 18 digits; edited values may be 10 to 18 digits. Delete the file to generate a fresh one, which regenerates both halves. Keep the number random, predictable values invite collisions with other servers.
 
-Students connect by opening Education Edition, pressing **Play**, then **Join World**, then the small **...** button to the right of the confirm button. In this dialog they can enter the connection ID to join.
+Players connect by opening Education Edition, pressing **Play**, then **Join World**, then the small **...** button to the right of the confirm button. In this dialog they can enter the connection ID to join.
 
 ## Join Codes (Optional)
 
-Join codes let students connect by entering symbols on Education Edition's join screen, or by clicking a share link. Each code only works for students in the same tenant as the account that created it.
+Join codes let players connect by entering symbols on Education Edition's join screen, or by clicking a share link. Each code only works for players in the same tenant as the account that created it.
 
 ### Quick Start
 
 1. Run `/edu joincode add` from the console
 2. Sign in with any M365 Education account when prompted
 3. The join code, share link, and connection ID are printed to the console
-4. Share with students:
+4. Share with players:
     * **Join code link** for joining with one click: `https://education.minecraft.net/joinworld/...`
     * **Connection ID**, which works across any tenant
 
@@ -80,8 +80,8 @@ Broadcasts your server to Education Edition's own server browser. Requires Globa
 
 ```yaml
 server-name: "Server Name"
-server-ip: "mc.example.com"  # Your public IP or hostname that students connect to.
-server-port: "19132"         # The external port students connect to.
+server-ip: "mc.example.com"  # Your public IP or hostname that players connect to.
+server-port: "19132"         # The external port players connect to.
 max-players: 40
 ```
 
@@ -117,7 +117,7 @@ tenants:
 * `enabled` is the master switch. Set it to `false` to turn the whitelist off without deleting your list.
 * While enabled, an empty list allows everyone and a filled list allows only the listed tenants.
 
-This is an advanced feature. A wrong tenant list stops legitimate students from joining, so leave the list empty unless you specifically need it.
+This is an advanced feature. A wrong tenant list stops legitimate players from joining, so leave the list empty unless you specifically need it.
 
 ## Files
 
