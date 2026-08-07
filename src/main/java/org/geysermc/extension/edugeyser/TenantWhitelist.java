@@ -7,23 +7,38 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.Consumer;
 
 public class TenantWhitelist {
 
     private static final String FILE_NAME = "tenant_whitelist.yml";
     private static final String LOG_PREFIX = "[TenantWhitelist] ";
 
-    private final Extension extension;
+    private final Path dataFolder;
+    private final Consumer<String> infoLogger;
+    private final Consumer<String> warningLogger;
+    private final Consumer<String> errorLogger;
     private final Set<String> allowedTenants = new HashSet<>();
     private boolean enabled = true;
 
     public TenantWhitelist(Extension extension) {
-        this.extension = extension;
+        this(extension.dataFolder(), extension.logger()::info,
+                extension.logger()::warning, extension.logger()::error);
+    }
+
+    TenantWhitelist(Path dataFolder, Consumer<String> infoLogger,
+                    Consumer<String> warningLogger, Consumer<String> errorLogger) {
+        this.dataFolder = dataFolder;
+        this.infoLogger = infoLogger;
+        this.warningLogger = warningLogger;
+        this.errorLogger = errorLogger;
     }
 
     public void load() {
-        Path path = extension.dataFolder().resolve(FILE_NAME);
+        Path path = dataFolder.resolve(FILE_NAME);
         if (!Files.exists(path)) {
+            enabled = true;
+            allowedTenants.clear();
             writeTemplate(path);
             return;
         }
@@ -36,7 +51,7 @@ public class TenantWhitelist {
             // If the on/off switch is missing (e.g. a config from before this option
             // existed), regenerate the whole file rather than work from a partial config.
             if (root.node("enabled").virtual()) {
-                extension.logger().warning(LOG_PREFIX + "Config is missing the 'enabled' option; regenerating " + FILE_NAME + " from defaults.");
+                warningLogger.accept(LOG_PREFIX + "Config is missing the 'enabled' option; regenerating " + FILE_NAME + " from defaults.");
                 writeTemplate(path);
                 enabled = true;
                 allowedTenants.clear();
@@ -54,20 +69,31 @@ public class TenantWhitelist {
                 }
             }
             if (!enabled) {
-                extension.logger().info(LOG_PREFIX + "Tenant whitelist is disabled (enabled: false). All tenants allowed; "
+                infoLogger.accept(LOG_PREFIX + "Tenant whitelist is disabled (enabled: false). All tenants allowed; "
                         + allowedTenants.size() + " tenant(s) kept in config.");
             } else if (!allowedTenants.isEmpty()) {
-                extension.logger().info(LOG_PREFIX + "Tenant whitelist active with " + allowedTenants.size() + " tenant(s).");
+                infoLogger.accept(LOG_PREFIX + "Tenant whitelist active with " + allowedTenants.size() + " tenant(s).");
             }
             // Enabled but empty is the default, unused state; stay silent to avoid log spam.
         } catch (Exception e) {
-            extension.logger().error(LOG_PREFIX + "Failed to load whitelist: " + e.getMessage());
+            // A malformed whitelist must not lock every Education client out of
+            // the server. Disable enforcement explicitly so a future reload
+            // cannot accidentally retain a previously loaded partial state.
+            enabled = false;
+            allowedTenants.clear();
+
+            errorLogger.accept(LOG_PREFIX + "============================================");
+            errorLogger.accept(LOG_PREFIX + "FAILED TO LOAD " + FILE_NAME);
+            errorLogger.accept(LOG_PREFIX + "The tenant whitelist will NOT be applied; all tenants are allowed.");
+            errorLogger.accept(LOG_PREFIX + "Fix the configuration and restart the server to enable it again.");
+            errorLogger.accept(LOG_PREFIX + "Reason: " + e.getMessage());
+            errorLogger.accept(LOG_PREFIX + "============================================");
         }
     }
 
     private void writeTemplate(Path path) {
         try {
-            Files.createDirectories(extension.dataFolder());
+            Files.createDirectories(dataFolder);
             Files.writeString(path,
                     "# tenant_whitelist.yml\n" +
                     "#\n" +
@@ -93,7 +119,7 @@ public class TenantWhitelist {
                     "  - \"\"\n" +
                     "  - \"\"\n");
         } catch (IOException e) {
-            extension.logger().error(LOG_PREFIX + "Failed to write whitelist file: " + e.getMessage());
+            errorLogger.accept(LOG_PREFIX + "Failed to write whitelist file: " + e.getMessage());
         }
     }
 
